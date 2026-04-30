@@ -185,9 +185,7 @@ void _PG_init(void)
 {
     prev_ExecutorEnd = ExecutorEnd_hook;
     ExecutorEnd_hook = auto_index_executor_end;
-
-    prev_ProcessUtility = ProcessUtility_hook;
-    ProcessUtility_hook = auto_index_process_utility;
+    /* ProcessUtility_hook not needed — DML goes through the executor, not utility */
 }
 
 static void
@@ -210,8 +208,11 @@ auto_index_executor_end(QueryDesc *queryDesc)
 |---|---|---|
 | `shmem_request_hook` | `miscadmin.h` | Postmaster sizing shared memory |
 | `shmem_startup_hook` | `storage/ipc.h` | Shared memory segment just created |
-| `ExecutorEnd_hook` | `executor/executor.h` | Query finishes executing |
-| `ProcessUtility_hook` | `tcop/utility.h` | Any non-SELECT statement (DDL, DML) |
+| `ExecutorEnd_hook` | `executor/executor.h` | Query finishes executing (SELECT and DML) |
+
+`ProcessUtility_hook` fires for DDL and other utility statements, but **not** for
+INSERT/UPDATE/DELETE — those go through the executor. Write tracking therefore lives
+in `ExecutorEnd_hook` alongside read tracking, by checking `queryDesc->operation`.
 
 ---
 
@@ -493,7 +494,7 @@ they determine the shared memory allocation computed in `shmem_request_hook`.
 |---|---|
 | `contrib/pg_stat_statements/pg_stat_statements.c` | Complete example of hooks + shared memory + bgworker in one extension |
 | `contrib/auto_explain/auto_explain.c` | Minimal executor hook example |
-| `src/backend/executor/execMain.c` | `ExecutorStart`, `ExecutorRun`, `ExecutorEnd` implementations |
+| `src/backend/executor/execMain.c` | `ExecutorStart`, `ExecutorRun`, `ExecutorEnd` implementations; `queryDesc->operation` |
 | `src/backend/executor/nodeSeqscan.c` | How SeqScan fetches tuples and evaluates quals |
 | `src/backend/postmaster/autovacuum.c` | Production-quality background worker with per-DB logic |
 | `src/backend/postmaster/bgworker.c` | Background worker registration and lifecycle |
@@ -504,3 +505,5 @@ they determine the shared memory allocation computed in `shmem_request_hook`.
 | `src/include/storage/shmem.h` | `ShmemInitStruct`, `RequestAddinShmemSpace` |
 | `src/include/storage/lwlock.h` | `LWLockAcquire`, `LWLockRelease` |
 | `src/include/executor/spi.h` | Full SPI API |
+| `src/include/utils/lsyscache.h` | `get_op_opfamily_membership` — classify operators as equality vs range |
+| `pg_stat_user_indexes` (system view) | Per-index `idx_scan` counts used by the bgworker for DROP decisions |
