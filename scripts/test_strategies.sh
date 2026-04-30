@@ -163,11 +163,13 @@ for strategy in $STRATEGIES; do
     echo "Indexes created on TPC-H tables: $cnt  (plus $cnt_self on auto_index_catalog itself)"
 
     $PSQL <<SQL
-SELECT c.relname AS table_name, ic.relname AS index_name, a.attname AS column_name
+SELECT c.relname                                  AS table_name,
+       ic.relname                                 AS index_name,
+       auto_index_attnames(ai.relid, ai.attnos)   AS columns,
+       array_length(ai.attnos, 1)                 AS n_cols
 FROM auto_index_catalog ai
 JOIN pg_class     c  ON c.oid = ai.relid
 JOIN pg_class     ic ON ic.oid = ai.indexrelid
-JOIN pg_attribute a  ON a.attrelid = ai.relid AND a.attnum = ai.attno
 WHERE ai.relid <> 'auto_index_catalog'::regclass
 ORDER BY ai.created_at;
 SQL

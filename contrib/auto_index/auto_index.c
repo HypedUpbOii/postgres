@@ -38,7 +38,7 @@ AutoIndexSharedState *auto_index_state = NULL;
 /* GUC variables */
 double	auto_index_threshold			= 10.0;
 int		auto_index_check_interval		= 300;
-int		auto_index_max_indexes_per_table = 3;
+int		auto_index_max_indexes_per_table = 6;
 
 /*
  * Selectable create-decision strategy.  Default preserves the existing
@@ -84,6 +84,8 @@ static void walk_plan_state(PlanState *node);
 static void process_seqscan(SeqScanState *node);
 static int	find_table_slot(Oid relid);
 static int	find_col_slot(int tslot, AttrNumber attno);
+static int	find_colset_slot(int tslot, const AttrNumber *attnos,
+								 const int8 *ops, int n_cols);
 static void evaluate_and_manage_indexes(AutoIndexTableStats *snapshot);
 
 void _PG_init(void);
@@ -119,10 +121,10 @@ _PG_init(void)
 
 	DefineCustomIntVariable(
 		"auto_index.max_indexes_per_table",
-		"Maximum number of auto-created indexes per table.",
+		"Maximum number of auto-created indexes per table (singletons + composites combined).",
 		NULL,
 		&auto_index_max_indexes_per_table,
-		3, 1, 10,
+		6, 1, 32,
 		PGC_SIGHUP,
 		0, NULL, NULL, NULL);
 
@@ -286,11 +288,117 @@ find_col_slot(int tslot, AttrNumber attno)
 	return empty_slot;
 }
 
+/*
+ * Find or allocate a colset slot for (sorted attnos, ops) inside table
+ * slot tslot.  attnos must already be sorted ascending; ops must be in
+ * the same order as attnos.  Returns -1 if all slots are full and no
+ * LRU-evictable slot exists (shouldn't happen given LRU fallback, but
+ * defensive).
+ */
+static int
+find_colset_slot(int tslot, const AttrNumber *attnos,
+				 const int8 *ops, int n_cols)
+{
+	AutoIndexColSet *slots = auto_index_state->tables[tslot].colsets;
+	int		i, j;
+	int		empty_slot = -1;
+	int		lru_slot = -1;
+	uint64	lru_time = UINT64_MAX;
+
+	for (i = 0; i < AUTO_INDEX_MAX_COLSETS; i++)
+	{
+		AutoIndexColSet *cs = &slots[i];
+
+		if (cs->n_cols == n_cols)
+		{
+			bool match = true;
+			for (j = 0; j < n_cols; j++)
+				if (cs->attnos[j] != attnos[j])
+				{
+					match = false;
+					break;
+				}
+			if (match)
+			{
+				cs->last_access_tick = ++auto_index_state->access_counter;
+				return i;
+			}
+		}
+		if (cs->n_cols == 0 && empty_slot == -1)
+			empty_slot = i;
+		if (cs->last_access_tick < lru_time)
+		{
+			lru_time = cs->last_access_tick;
+			lru_slot = i;
+		}
+	}
+
+	i = (empty_slot != -1) ? empty_slot : lru_slot;
+	if (i < 0)
+		return -1;					/* defensive */
+
+	memset(&slots[i], 0, sizeof(AutoIndexColSet));
+	slots[i].n_cols = (int8) n_cols;
+	for (j = 0; j < n_cols; j++)
+	{
+		slots[i].attnos[j] = attnos[j];
+		slots[i].ops[j] = ops[j];
+	}
+	slots[i].last_access_tick = ++auto_index_state->access_counter;
+	return i;
+}
+
 
 /* -------------------------------------------------------------------------
  * Executor hook — SeqScan qual extraction
  * -------------------------------------------------------------------------
  */
+
+/*
+ * Local accumulator: tracks the predicates observed in a single query's
+ * qual list.  We collect first, then bump shared-memory counters under
+ * the lock — that gives us a clean view of "these N columns appeared
+ * together" which is what colset tracking needs.
+ */
+typedef struct LocalPred
+{
+	AttrNumber	attno;
+	int8		op;					/* 0 = equality, 1 = range */
+} LocalPred;
+
+#define LOCAL_PRED_MAX	16			/* per-query distinct attrs we track */
+
+typedef struct QualSet
+{
+	LocalPred	preds[LOCAL_PRED_MAX];
+	int			n_preds;
+} QualSet;
+
+/* Add (attno, op) to qs, deduplicating by attno.  Equality wins over range
+ * if the same column appears with both kinds of predicates. */
+static void
+qualset_add(QualSet *qs, AttrNumber attno, int8 op)
+{
+	int		i;
+
+	if (!AttrNumberIsForUserDefinedAttr(attno))
+		return;
+
+	for (i = 0; i < qs->n_preds; i++)
+	{
+		if (qs->preds[i].attno == attno)
+		{
+			if (op == 0)
+				qs->preds[i].op = 0;	/* upgrade range -> eq */
+			return;
+		}
+	}
+	if (qs->n_preds >= LOCAL_PRED_MAX)
+		return;
+	qs->preds[qs->n_preds].attno = attno;
+	qs->preds[qs->n_preds].op = op;
+	qs->n_preds++;
+}
 
 /*
  * Peel implicit-cast wrappers off an expression so the underlying Var
@@ -306,46 +414,39 @@ strip_implicit_casts(Expr *e)
 }
 
 /*
- * Bump the right hit counter for one (attno, op-name) observation.
- * Caller must already hold the LWLock.
+ * Convert a postgres operator name to our 0=eq / 1=range encoding.
+ * Returns -1 if the operator is something we don't track.
  */
-static void
-bump_hit(int tslot, AttrNumber attno, const char *opname)
+static int8
+opname_to_op(const char *opname)
 {
-	int		cslot;
-
-	if (!AttrNumberIsForUserDefinedAttr(attno))
-		return;
-	cslot = find_col_slot(tslot, attno);
-	if (cslot < 0)
-		return;
-
 	if (strcmp(opname, "=") == 0)
-		auto_index_state->tables[tslot].columns[cslot].equality_hits++;
-	else if (strcmp(opname, "<")  == 0 || strcmp(opname, ">")  == 0 ||
-			 strcmp(opname, "<=") == 0 || strcmp(opname, ">=") == 0)
-		auto_index_state->tables[tslot].columns[cslot].range_hits++;
+		return 0;
+	if (strcmp(opname, "<")  == 0 || strcmp(opname, ">")  == 0 ||
+		strcmp(opname, "<=") == 0 || strcmp(opname, ">=") == 0)
+		return 1;
+	return -1;
 }
 
 /*
- * Walk one expression node and record any column predicates we can
- * recognise.  Recurses into BoolExpr (AND/OR/NOT) so quals nested inside
- * disjunctions (e.g. TPC-H Q19) are still observed.
+ * Walk one expression node and accumulate every column predicate we can
+ * recognise into qs.  Recurses into BoolExpr (AND/OR/NOT) so quals
+ * nested inside disjunctions (e.g. TPC-H Q19) are still observed.
  */
 static void
-process_qual_node(int tslot, Expr *expr)
+process_qual_node(QualSet *qs, Expr *expr)
 {
 	if (expr == NULL)
 		return;
 
-	/* AND / OR / NOT — recurse into each child as if it were top-level. */
+	/* AND / OR / NOT — recurse into each child. */
 	if (IsA(expr, BoolExpr))
 	{
 		BoolExpr   *b = (BoolExpr *) expr;
 		ListCell   *lc;
 
 		foreach(lc, b->args)
-			process_qual_node(tslot, (Expr *) lfirst(lc));
+			process_qual_node(qs, (Expr *) lfirst(lc));
 		return;
 	}
 
@@ -355,6 +456,7 @@ process_qual_node(int tslot, Expr *expr)
 		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) expr;
 		Expr	   *arg;
 		char	   *opname;
+		int8		op;
 
 		if (list_length(saop->args) < 1)
 			return;
@@ -365,25 +467,30 @@ process_qual_node(int tslot, Expr *expr)
 		opname = get_opname(saop->opno);
 		if (opname == NULL)
 			return;
-		bump_hit(tslot, ((Var *) arg)->varattno, opname);
+		op = opname_to_op(opname);
 		pfree(opname);
+		if (op < 0)
+			return;
+
+		qualset_add(qs, ((Var *) arg)->varattno, op);
 		return;
 	}
 
 	/* Var <op> Const  /  Const <op> Var */
 	if (IsA(expr, OpExpr))
 	{
-		OpExpr	   *op = (OpExpr *) expr;
+		OpExpr	   *opx = (OpExpr *) expr;
 		Expr	   *left,
 				   *right;
 		AttrNumber	attno = InvalidAttrNumber;
 		char	   *opname;
+		int8		op;
 
-		if (list_length(op->args) < 2)
+		if (list_length(opx->args) < 2)
 			return;					/* defensive: unary OpExpr */
 
-		left  = strip_implicit_casts((Expr *) linitial(op->args));
-		right = strip_implicit_casts((Expr *) lsecond(op->args));
+		left  = strip_implicit_casts((Expr *) linitial(opx->args));
+		right = strip_implicit_casts((Expr *) lsecond(opx->args));
 
 		if (IsA(left, Var) && IsA(right, Const))
 			attno = ((Var *) left)->varattno;
@@ -392,24 +499,97 @@ process_qual_node(int tslot, Expr *expr)
 		else
 			return;
 
-		opname = get_opname(op->opno);
+		opname = get_opname(opx->opno);
 		if (opname == NULL)
 			return;
-		bump_hit(tslot, attno, opname);
+		op = opname_to_op(opname);
 		pfree(opname);
+		if (op < 0)
+			return;
+
+		qualset_add(qs, attno, op);
 		return;
 	}
 
 	/*
 	 * Other node types (FuncExpr casts, NullTest, CaseExpr, SubPlan, ...)
-	 * — silently ignore.  These are real opportunities to extend later.
+	 * — silently ignore.
 	 */
+}
+
+/* Stable sort qs->preds by attno ascending — small N, insertion sort.
+ * Used to derive the canonical lookup key for find_colset_slot. */
+static void
+qualset_sort_by_attno(QualSet *qs)
+{
+	int		i, j;
+	for (i = 1; i < qs->n_preds; i++)
+	{
+		LocalPred key = qs->preds[i];
+		j = i - 1;
+		while (j >= 0 && qs->preds[j].attno > key.attno)
+		{
+			qs->preds[j + 1] = qs->preds[j];
+			j--;
+		}
+		qs->preds[j + 1] = key;
+	}
+}
+
+/* If we observed > AUTO_INDEX_COLSET_MAX_COLS user-attrs, reduce qs in
+ * place to the top AUTO_INDEX_COLSET_MAX_COLS — equality preferred,
+ * then by attno ascending.  Result is still sorted by attno. */
+static void
+qualset_trim_to_max(QualSet *qs)
+{
+	int		i, j;
+	int		eq_count = 0;
+	LocalPred picked[AUTO_INDEX_COLSET_MAX_COLS];
+	int		n_picked = 0;
+
+	if (qs->n_preds <= AUTO_INDEX_COLSET_MAX_COLS)
+		return;
+
+	/* Pass 1: take equality preds first. */
+	for (i = 0; i < qs->n_preds && n_picked < AUTO_INDEX_COLSET_MAX_COLS; i++)
+		if (qs->preds[i].op == 0)
+		{
+			picked[n_picked++] = qs->preds[i];
+			eq_count++;
+		}
+	/* Pass 2: top up with range preds if we have room. */
+	for (i = 0; i < qs->n_preds && n_picked < AUTO_INDEX_COLSET_MAX_COLS; i++)
+		if (qs->preds[i].op == 1)
+			picked[n_picked++] = qs->preds[i];
+
+	/* Re-sort the picked ones by attno. */
+	for (i = 1; i < n_picked; i++)
+	{
+		LocalPred key = picked[i];
+		j = i - 1;
+		while (j >= 0 && picked[j].attno > key.attno)
+		{
+			picked[j + 1] = picked[j];
+			j--;
+		}
+		picked[j + 1] = key;
+	}
+
+	for (i = 0; i < n_picked; i++)
+		qs->preds[i] = picked[i];
+	qs->n_preds = n_picked;
+	(void) eq_count;
 }
 
 /*
  * Process one SeqScan node: walk its qual list and record per-column
- * predicate hits in shared memory.  Quals are an implicit-AND list of
- * Exprs; each Expr can be an OpExpr, ScalarArrayOpExpr, BoolExpr, etc.
+ * predicate hits AND multi-column co-occurrence in shared memory.
+ *
+ *   Step 1: walk the qual tree, accumulating distinct (attno, op) pairs
+ *           into a local QualSet (no lock held).
+ *   Step 2: under the lock, bump the singleton hit counter for every
+ *           attr in the QualSet, AND if 2-3 distinct attrs were observed,
+ *           bump the matching colset slot.
  */
 static void
 process_seqscan(SeqScanState *node)
@@ -419,6 +599,8 @@ process_seqscan(SeqScanState *node)
 	int			tslot;
 	List	   *qual;
 	ListCell   *lc;
+	QualSet		qs;
+	int			i;
 
 	rel = node->ss.ss_currentRelation;
 	if (rel == NULL)
@@ -433,12 +615,51 @@ process_seqscan(SeqScanState *node)
 	if (qual == NIL)
 		return;
 
+	/* Step 1: accumulate predicates without holding the lock. */
+	qs.n_preds = 0;
+	foreach(lc, qual)
+		process_qual_node(&qs, (Expr *) lfirst(lc));
+
+	if (qs.n_preds == 0)
+		return;
+
+	qualset_sort_by_attno(&qs);
+	qualset_trim_to_max(&qs);
+
+	/* Step 2: apply to shared memory. */
 	LWLockAcquire(auto_index_state->lock, LW_EXCLUSIVE);
 
 	tslot = find_table_slot(relid);
 
-	foreach(lc, qual)
-		process_qual_node(tslot, (Expr *) lfirst(lc));
+	/* Bump singletons. */
+	for (i = 0; i < qs.n_preds; i++)
+	{
+		int		cslot = find_col_slot(tslot, qs.preds[i].attno);
+		if (cslot < 0)
+			continue;
+		if (qs.preds[i].op == 0)
+			auto_index_state->tables[tslot].columns[cslot].equality_hits++;
+		else
+			auto_index_state->tables[tslot].columns[cslot].range_hits++;
+	}
+
+	/* Bump colset if 2+ distinct attrs.  attnos sorted ascending; ops
+	 * aligned with attnos. */
+	if (qs.n_preds >= 2 && qs.n_preds <= AUTO_INDEX_COLSET_MAX_COLS)
+	{
+		AttrNumber	attnos[AUTO_INDEX_COLSET_MAX_COLS];
+		int8		ops[AUTO_INDEX_COLSET_MAX_COLS];
+		int			cset;
+
+		for (i = 0; i < qs.n_preds; i++)
+		{
+			attnos[i] = qs.preds[i].attno;
+			ops[i] = qs.preds[i].op;
+		}
+		cset = find_colset_slot(tslot, attnos, ops, qs.n_preds);
+		if (cset >= 0)
+			auto_index_state->tables[tslot].colsets[cset].hits++;
+	}
 
 	LWLockRelease(auto_index_state->lock);
 }
@@ -658,10 +879,11 @@ auto_index_stats(PG_FUNCTION_ARGS)
 typedef struct CreateDecision
 {
 	Oid			relid;
-	AttrNumber	attno;
+	int			n_cols;								/* 1 = singleton, 2-3 = composite */
+	AttrNumber	attnos[AUTO_INDEX_COLSET_MAX_COLS];	/* ordered for CREATE INDEX */
 	char		schema[NAMEDATALEN];
 	char		relname[NAMEDATALEN];
-	char		attname[NAMEDATALEN];
+	char		attnames[AUTO_INDEX_COLSET_MAX_COLS][NAMEDATALEN];
 	char		idxname[NAMEDATALEN];
 } CreateDecision;
 
@@ -888,10 +1110,67 @@ decide_create(const CreateContext *cc)
 }
 
 /*
+ * Reorder a colset for the actual CREATE INDEX:
+ *   1. Equality columns first (most restrictive predicates lead — also
+ *      the only way the planner can use later columns of a B-tree).
+ *   2. Range columns next.
+ *   3. Within each group, ascending by attno (deterministic naming).
+ *
+ * out_attnos / out_ops must each have room for cs->n_cols entries.
+ */
+static void
+reorder_colset_for_index(const AutoIndexColSet *cs,
+						 AttrNumber *out_attnos, int8 *out_ops)
+{
+	int		i, k = 0;
+
+	/* Equality first */
+	for (i = 0; i < cs->n_cols; i++)
+		if (cs->ops[i] == 0)
+		{
+			out_attnos[k] = cs->attnos[i];
+			out_ops[k] = 0;
+			k++;
+		}
+	/* Range last */
+	for (i = 0; i < cs->n_cols; i++)
+		if (cs->ops[i] == 1)
+		{
+			out_attnos[k] = cs->attnos[i];
+			out_ops[k] = 1;
+			k++;
+		}
+}
+
+/*
+ * Subsumption check.  Returns true if (relid, attno) is the LEADING
+ * column of a composite already queued in to_create[].  When the
+ * composite exists the planner can serve `WHERE col = ?` queries via
+ * leftmost-prefix, so a separate singleton on that column is redundant.
+ */
+static bool
+is_attno_covered_by_pending_composite(const CreateDecision *to_create,
+									  int n_create,
+									  Oid relid, AttrNumber attno)
+{
+	int		i;
+	for (i = 0; i < n_create; i++)
+	{
+		if (to_create[i].relid == relid &&
+			to_create[i].n_cols >= 2 &&
+			to_create[i].attnos[0] == attno)
+			return true;
+	}
+	return false;
+}
+
+/*
  * Core evaluation loop.  snapshot is a local copy of the shared memory
  * tables array taken before any SPI work.
  *
  * Phase 1: run SELECTs inside a normal transaction to gather decisions.
+ *          Composites are evaluated FIRST so their leading columns can
+ *          subsume singleton candidates in the second loop.
  * Phase 2: execute DDL in a non-atomic SPI context.
  */
 static void
@@ -1057,91 +1336,206 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 								Max(seq_scan_cost_val, 1.0)));
 		drop_threshold   = (int64) (build_cost_val * 1000.0);
 
-		/* CREATE candidates: columns with predicate hits and no existing index */
-		for (c = 0; c < AUTO_INDEX_MAX_COLS && n_create < MAX_DECISIONS; c++)
+		/*
+		 * CREATE candidates — composites FIRST, then singletons.
+		 *
+		 * A composite (a, b, c) is strictly superior to a singleton on the
+		 * leading column `a` for any query that filters on `a` alone (B-tree
+		 * leftmost prefix), so we want composites to win when both qualify.
+		 * Singletons on non-leading columns of the composite are NOT
+		 * suppressed — those queries can't use the composite.
+		 */
 		{
-			AutoIndexColumnStats *col = &t->columns[c];
-			double	cum_ratio;
-			int		ret2;
+			int		cs_idx;
 
-			if (!AttrNumberIsForUserDefinedAttr(col->attribute_number))
-				continue;
-
-			/*
-			 * Strategy dispatch.  When auto_index.create_strategy is
-			 * ski_rental (the default), we keep the original inline checks
-			 * verbatim so behaviour is bit-for-bit identical to before this
-			 * refactor.  For any other strategy, decide_create() routes to
-			 * the matching decide_create_* function above.
-			 */
-			if (auto_index_create_strategy == AI_CREATE_SKI_RENTAL)
+			/* === Composite candidates === */
+			for (cs_idx = 0;
+				 cs_idx < AUTO_INDEX_MAX_COLSETS && n_create < MAX_DECISIONS;
+				 cs_idx++)
 			{
-				/*
-				 * Ski rental create: only buy the index once cumulative "rent"
-				 * (total seq-scan overhead paid across all intervals) reaches
-				 * the index build cost, expressed in query-equivalent units.
-				 */
-				if (col->cumulative_benefit < create_threshold)
+				AutoIndexColSet	   *cs = &t->colsets[cs_idx];
+				AttrNumber			ord_attnos[AUTO_INDEX_COLSET_MAX_COLS];
+				int8				ord_ops[AUTO_INDEX_COLSET_MAX_COLS];
+				bool				skip = false;
+				int					ci;
+				CreateDecision	   *d;
+				char				attno_list[64];
+
+				if (cs->n_cols < 2)
 					continue;
 
-				/*
-				 * Write-ratio guard: if the table is write-heavy relative to
-				 * reads over its lifetime, index maintenance would outweigh
-				 * the savings.
-				 */
-				cum_ratio = (double) col->cumulative_benefit
-							/ Max(1, t->cumulative_write_cost);
-				if (cum_ratio <= auto_index_threshold)
+				/* Strategy gate.  ski_rental keeps its original two-check
+				 * cost+ratio test inline; other strategies use a synthetic
+				 * column-stats so the existing decide_create() works. */
+				if (auto_index_create_strategy == AI_CREATE_SKI_RENTAL)
+				{
+					double	cum_ratio;
+
+					if (cs->cumulative_benefit < create_threshold)
+						continue;
+					cum_ratio = (double) cs->cumulative_benefit
+								/ Max(1, t->cumulative_write_cost);
+					if (cum_ratio <= auto_index_threshold)
+						continue;
+				}
+				else
+				{
+					AutoIndexColumnStats	syn;
+					CreateContext			cc;
+
+					memset(&syn, 0, sizeof(syn));
+					syn.attribute_number	= cs->attnos[0];
+					syn.cumulative_benefit	= cs->cumulative_benefit;
+
+					cc.col				= &syn;
+					cc.tbl				= t;
+					cc.create_threshold = create_threshold;
+					cc.seq_scan_cost	= seq_scan_cost_val;
+					cc.build_cost		= build_cost_val;
+					cc.maint_per_write	= maint_per_write;
+					cc.reltuples		= reltuples;
+					cc.relpages			= relpages;
+
+					if (!decide_create(&cc))
+						continue;
+				}
+
+				if (count_auto_indexes(t->relation_id) >=
+					auto_index_max_indexes_per_table)
+					break;					/* per-table cap reached */
+
+				/* Reorder for B-tree leading-column priority. */
+				reorder_colset_for_index(cs, ord_attnos, ord_ops);
+				(void) attno_list;
+
+				d = &to_create[n_create];
+				d->relid	= t->relation_id;
+				d->n_cols	= cs->n_cols;
+				for (ci = 0; ci < cs->n_cols; ci++)
+					d->attnos[ci] = ord_attnos[ci];
+				strlcpy(d->schema,	schema,		NAMEDATALEN);
+				strlcpy(d->relname, relname,	NAMEDATALEN);
+
+				/* Resolve column names individually.  If any lookup fails
+				 * we abandon the whole composite to avoid partial state. */
+				for (ci = 0; ci < cs->n_cols; ci++)
+				{
+					Oid		argtypes[2] = {OIDOID, INT2OID};
+					Datum	args[2]		= {ObjectIdGetDatum(t->relation_id),
+										   Int16GetDatum(d->attnos[ci])};
+					char	nulls[2]	= {' ', ' '};
+					int		ret2;
+					char   *attname;
+
+					ret2 = SPI_execute_with_args(
+						"SELECT attname FROM pg_attribute "
+						"WHERE attrelid = $1 AND attnum = $2 AND NOT attisdropped",
+						2, argtypes, args, nulls, true, 1);
+					if (ret2 != SPI_OK_SELECT || SPI_processed == 0)
+					{
+						skip = true;
+						break;
+					}
+					attname = SPI_getvalue(SPI_tuptable->vals[0],
+										   SPI_tuptable->tupdesc, 1);
+					strlcpy(d->attnames[ci], attname, NAMEDATALEN);
+				}
+				if (skip)
 					continue;
-			}
-			else
-			{
-				CreateContext cc;
 
-				cc.col				= col;
-				cc.tbl				= t;
-				cc.create_threshold = create_threshold;
-				cc.seq_scan_cost	= seq_scan_cost_val;
-				cc.build_cost		= build_cost_val;
-				cc.maint_per_write	= maint_per_write;
-				cc.reltuples		= reltuples;
-				cc.relpages			= relpages;
+				/* Index name: auto_idx_m_<relid>_<attnos…> */
+				if (cs->n_cols == 2)
+					snprintf(d->idxname, NAMEDATALEN,
+							 "auto_idx_m_%u_%d_%d",
+							 t->relation_id, d->attnos[0], d->attnos[1]);
+				else
+					snprintf(d->idxname, NAMEDATALEN,
+							 "auto_idx_m_%u_%d_%d_%d",
+							 t->relation_id, d->attnos[0], d->attnos[1], d->attnos[2]);
 
-				if (!decide_create(&cc))
-					continue;
-			}
-
-			if (index_exists_for_column(t->relation_id, col->attribute_number))
-				continue;
-			if (count_auto_indexes(t->relation_id) >= auto_index_max_indexes_per_table)
-				continue;
-
-			/* Resolve column name */
-			{
-				Oid		col_argtypes[2] = {OIDOID, INT2OID};
-				Datum	col_args[2]		= {ObjectIdGetDatum(t->relation_id),
-										   Int16GetDatum(col->attribute_number)};
-				char	col_nulls[2]	= {' ', ' '};
-				char   *attname;
-				CreateDecision *d = &to_create[n_create];
-
-				ret2 = SPI_execute_with_args(
-					"SELECT attname FROM pg_attribute "
-					"WHERE attrelid = $1 AND attnum = $2 AND NOT attisdropped",
-					2, col_argtypes, col_args, col_nulls, true, 1);
-				if (ret2 != SPI_OK_SELECT || SPI_processed == 0)
-					continue;
-
-				attname = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-
-				d->relid = t->relation_id;
-				d->attno = col->attribute_number;
-				strlcpy(d->schema,  schema,  NAMEDATALEN);
-				strlcpy(d->relname, relname, NAMEDATALEN);
-				strlcpy(d->attname, attname, NAMEDATALEN);
-				snprintf(d->idxname, NAMEDATALEN, "auto_idx_%u_%d",
-						 t->relation_id, col->attribute_number);
 				n_create++;
+			}
+
+			/* === Singleton candidates === */
+			for (c = 0; c < AUTO_INDEX_MAX_COLS && n_create < MAX_DECISIONS; c++)
+			{
+				AutoIndexColumnStats   *col = &t->columns[c];
+				double					cum_ratio;
+				int						ret2;
+
+				if (!AttrNumberIsForUserDefinedAttr(col->attribute_number))
+					continue;
+
+				/* Subsumption: leading column of a composite we already
+				 * queued.  Don't create the singleton; the composite will
+				 * serve `WHERE col = ?` via leftmost prefix. */
+				if (is_attno_covered_by_pending_composite(
+						to_create, n_create,
+						t->relation_id, col->attribute_number))
+					continue;
+
+				/* Strategy dispatch.  ski_rental keeps original inline
+				 * behaviour; others go through decide_create(). */
+				if (auto_index_create_strategy == AI_CREATE_SKI_RENTAL)
+				{
+					if (col->cumulative_benefit < create_threshold)
+						continue;
+					cum_ratio = (double) col->cumulative_benefit
+								/ Max(1, t->cumulative_write_cost);
+					if (cum_ratio <= auto_index_threshold)
+						continue;
+				}
+				else
+				{
+					CreateContext cc;
+
+					cc.col				= col;
+					cc.tbl				= t;
+					cc.create_threshold = create_threshold;
+					cc.seq_scan_cost	= seq_scan_cost_val;
+					cc.build_cost		= build_cost_val;
+					cc.maint_per_write	= maint_per_write;
+					cc.reltuples		= reltuples;
+					cc.relpages			= relpages;
+
+					if (!decide_create(&cc))
+						continue;
+				}
+
+				if (index_exists_for_column(t->relation_id, col->attribute_number))
+					continue;
+				if (count_auto_indexes(t->relation_id) >=
+					auto_index_max_indexes_per_table)
+					continue;
+
+				/* Resolve column name */
+				{
+					Oid		col_argtypes[2] = {OIDOID, INT2OID};
+					Datum	col_args[2]		= {ObjectIdGetDatum(t->relation_id),
+										   Int16GetDatum(col->attribute_number)};
+					char	col_nulls[2]	= {' ', ' '};
+					char   *attname;
+					CreateDecision *d = &to_create[n_create];
+
+					ret2 = SPI_execute_with_args(
+						"SELECT attname FROM pg_attribute "
+						"WHERE attrelid = $1 AND attnum = $2 AND NOT attisdropped",
+						2, col_argtypes, col_args, col_nulls, true, 1);
+					if (ret2 != SPI_OK_SELECT || SPI_processed == 0)
+						continue;
+
+					attname = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+
+					d->relid	 = t->relation_id;
+					d->n_cols	 = 1;
+					d->attnos[0] = col->attribute_number;
+					strlcpy(d->schema,		schema,  NAMEDATALEN);
+					strlcpy(d->relname,		relname, NAMEDATALEN);
+					strlcpy(d->attnames[0], attname, NAMEDATALEN);
+					snprintf(d->idxname, NAMEDATALEN, "auto_idx_%u_%d",
+							 t->relation_id, col->attribute_number);
+					n_create++;
+				}
 			}
 		}
 
@@ -1321,10 +1715,39 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 	{
 		CreateDecision *d = &to_create[i];
 		char	sql[1024];
+		char	collist[NAMEDATALEN * AUTO_INDEX_COLSET_MAX_COLS + 16];
+		char	attnos_literal[64];
+		int		k;
+
+		/* Build "col1, col2, col3" for CREATE INDEX. */
+		{
+			int written = 0;
+			for (k = 0; k < d->n_cols; k++)
+			{
+				written += snprintf(collist + written,
+									sizeof(collist) - written,
+									"%s%s",
+									(k == 0 ? "" : ", "),
+									d->attnames[k]);
+			}
+		}
+
+		/* Build "ARRAY[a, b, c]::smallint[]" for catalog INSERT. */
+		{
+			int written = snprintf(attnos_literal, sizeof(attnos_literal),
+								   "ARRAY[%d", d->attnos[0]);
+			for (k = 1; k < d->n_cols; k++)
+				written += snprintf(attnos_literal + written,
+									sizeof(attnos_literal) - written,
+									", %d", d->attnos[k]);
+			snprintf(attnos_literal + written,
+					 sizeof(attnos_literal) - written,
+					 "]::smallint[]");
+		}
 
 		snprintf(sql, sizeof(sql),
 				 "CREATE INDEX IF NOT EXISTS %s ON %s.%s (%s)",
-				 d->idxname, d->schema, d->relname, d->attname);
+				 d->idxname, d->schema, d->relname, collist);
 
 		PG_TRY();
 		{
@@ -1337,27 +1760,35 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 
 			/* Record in catalog using INSERT...SELECT to avoid a separate
 			 * OID lookup — the index is visible in pg_class within the same
-			 * transaction so this finds it and inserts in one statement. */
+			 * transaction so this finds it and inserts in one statement.
+			 *
+			 * The attnos array is interpolated into the SQL text directly
+			 * (small ints from internal sources, no injection risk) because
+			 * SPI_execute_with_args has no convenient way to pass an array
+			 * literal as a single bind. */
 			{
-				Oid		argtypes[3] = {OIDOID, INT2OID, NAMEOID};
-				Datum	args[3]		= {ObjectIdGetDatum(d->relid),
-									   Int16GetDatum(d->attno),
+				char	insert_sql[768];
+				Oid		argtypes[2] = {OIDOID, NAMEOID};
+				Datum	args[2]		= {ObjectIdGetDatum(d->relid),
 									   DirectFunctionCall1(namein,
 										   CStringGetDatum(d->idxname))};
-				char	nulls[3]	= {' ', ' ', ' '};
+				char	nulls[2]	= {' ', ' '};
+
+				snprintf(insert_sql, sizeof(insert_sql),
+					"INSERT INTO auto_index_catalog "
+					"    (relid, indexrelid, attnos, created_at, last_checked_idx_scan) "
+					"SELECT $1, c.oid, %s, now(), -1 "
+					"FROM   pg_class c "
+					"JOIN   pg_namespace n ON n.oid = c.relnamespace "
+					"WHERE  c.relname = $2 AND n.nspname = 'public' "
+					"ON CONFLICT DO NOTHING",
+					attnos_literal);
 
 				/* Use -1 as the initial baseline so the first DROP evaluation
 				 * sees cur_scan(0) != last_scan(-1) and skips the drop.
 				 * Only after one full interval with no usage will it drop. */
-				SPI_execute_with_args(
-					"INSERT INTO auto_index_catalog "
-					"    (relid, indexrelid, attno, created_at, last_checked_idx_scan) "
-					"SELECT $1, c.oid, $2, now(), -1 "
-					"FROM   pg_class c "
-					"JOIN   pg_namespace n ON n.oid = c.relnamespace "
-					"WHERE  c.relname = $3 AND n.nspname = 'public' "
-					"ON CONFLICT DO NOTHING",
-					3, argtypes, args, nulls, false, 0);
+				SPI_execute_with_args(insert_sql,
+									  2, argtypes, args, nulls, false, 0);
 			}
 
 			PopActiveSnapshot();
@@ -1365,32 +1796,77 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 			CommitTransactionCommand();
 
 			/*
-			 * Reset cumulative_benefit for this column so the ski rental
-			 * counter starts fresh — the column now has an index and
-			 * shouldn't immediately re-qualify for another one.
+			 * Reset cumulative_benefit so this column / colset doesn't
+			 * immediately re-qualify on the next pass.  For singletons we
+			 * reset the column slot; for composites we reset the matching
+			 * colset slot AND the leading column's singleton (since the
+			 * composite serves it via leftmost-prefix).
 			 */
 			{
-				int si, ci;
+				int si, ci, csi, m;
+
 				LWLockAcquire(auto_index_state->lock, LW_EXCLUSIVE);
 				for (si = 0; si < AUTO_INDEX_MAX_TABLES; si++)
 				{
+					AutoIndexTableStats *t;
+
 					if (auto_index_state->tables[si].relation_id != d->relid)
 						continue;
-					for (ci = 0; ci < AUTO_INDEX_MAX_COLS; ci++)
+					t = &auto_index_state->tables[si];
+
+					if (d->n_cols == 1)
 					{
-						if (auto_index_state->tables[si].columns[ci].attribute_number == d->attno)
+						for (ci = 0; ci < AUTO_INDEX_MAX_COLS; ci++)
+							if (t->columns[ci].attribute_number == d->attnos[0])
+							{
+								t->columns[ci].cumulative_benefit = 0;
+								break;
+							}
+					}
+					else
+					{
+						/* Reset matching colset (any-order match on the set
+						 * of attnos). */
+						for (csi = 0; csi < AUTO_INDEX_MAX_COLSETS; csi++)
 						{
-							auto_index_state->tables[si].columns[ci].cumulative_benefit = 0;
-							break;
+							AutoIndexColSet *cs = &t->colsets[csi];
+							bool match;
+
+							if (cs->n_cols != d->n_cols)
+								continue;
+							match = true;
+							for (m = 0; m < d->n_cols && match; m++)
+							{
+								int n;
+								bool found = false;
+								for (n = 0; n < cs->n_cols; n++)
+									if (cs->attnos[n] == d->attnos[m])
+									{
+										found = true;
+										break;
+									}
+								if (!found)
+									match = false;
+							}
+							if (match)
+								cs->cumulative_benefit = 0;
 						}
+						/* Reset leading column singleton too. */
+						for (ci = 0; ci < AUTO_INDEX_MAX_COLS; ci++)
+							if (t->columns[ci].attribute_number == d->attnos[0])
+							{
+								t->columns[ci].cumulative_benefit = 0;
+								break;
+							}
 					}
 					break;
 				}
 				LWLockRelease(auto_index_state->lock);
 			}
 
-			elog(LOG, "auto_index: created index %s on %s.%s (%s)",
-				 d->idxname, d->schema, d->relname, d->attname);
+			elog(LOG, "auto_index: created %s index %s on %s.%s (%s)",
+				 (d->n_cols == 1 ? "single-col" : "composite"),
+				 d->idxname, d->schema, d->relname, collist);
 		}
 		PG_CATCH();
 		{
@@ -1510,12 +1986,24 @@ auto_index_main(Datum main_arg)
 			for (si = 0; si < AUTO_INDEX_MAX_TABLES; si++)
 			{
 				AutoIndexTableStats *t = &auto_index_state->tables[si];
+				int		csi;
 
 				t->cumulative_write_cost += t->insert_count + t->update_count + t->delete_count;
 				for (ci = 0; ci < AUTO_INDEX_MAX_COLS; ci++)
 				{
 					t->columns[ci].cumulative_benefit +=
 						t->columns[ci].equality_hits * 2 + t->columns[ci].range_hits;
+				}
+				for (csi = 0; csi < AUTO_INDEX_MAX_COLSETS; csi++)
+				{
+					/* Composite benefit weight: each hit reflects ALL the
+					 * columns that came together, so it's worth more than
+					 * a single-column hit.  Use n_cols × hits to bias
+					 * toward composites the planner can actually exploit. */
+					AutoIndexColSet *cs = &t->colsets[csi];
+					if (cs->n_cols == 0)
+						continue;
+					cs->cumulative_benefit += cs->hits * cs->n_cols;
 				}
 			}
 
@@ -1526,6 +2014,7 @@ auto_index_main(Datum main_arg)
 			for (si = 0; si < AUTO_INDEX_MAX_TABLES; si++)
 			{
 				AutoIndexTableStats *t = &auto_index_state->tables[si];
+				int		csi;
 
 				t->insert_count = 0;
 				t->update_count = 0;
@@ -1535,6 +2024,8 @@ auto_index_main(Datum main_arg)
 					t->columns[ci].equality_hits = 0;
 					t->columns[ci].range_hits    = 0;
 				}
+				for (csi = 0; csi < AUTO_INDEX_MAX_COLSETS; csi++)
+					t->colsets[csi].hits = 0;
 			}
 
 			LWLockRelease(auto_index_state->lock);

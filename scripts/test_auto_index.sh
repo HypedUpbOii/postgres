@@ -144,14 +144,14 @@ banner "Step 6: indexes created by auto_index"
 
 $PSQL <<SQL
 SELECT
-    c.relname       AS table_name,
-    ic.relname      AS index_name,
-    a.attname       AS column_name,
+    c.relname                                  AS table_name,
+    ic.relname                                 AS index_name,
+    auto_index_attnames(ai.relid, ai.attnos)   AS columns,
+    array_length(ai.attnos, 1)                 AS n_cols,
     ai.created_at
 FROM auto_index_catalog ai
-JOIN pg_class     c  ON c.oid      = ai.relid
-JOIN pg_class     ic ON ic.oid     = ai.indexrelid
-JOIN pg_attribute a  ON a.attrelid = ai.relid AND a.attnum = ai.attno
+JOIN pg_class     c  ON c.oid  = ai.relid
+JOIN pg_class     ic ON ic.oid = ai.indexrelid
 ORDER BY ai.created_at;
 SQL
 

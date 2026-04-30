@@ -52,11 +52,11 @@ banner() { echo ""; echo "$SEP"; echo "  $1"; echo "$SEP"; }
 list_drop_indexes() {
     local rows
     rows=$($PSQL -Atq <<SQL
-SELECT ic.relname || ' on ' || a.attname
+SELECT ic.relname || ' on (' ||
+       auto_index_attnames(ai.relid, ai.attnos) || ')'
 FROM auto_index_catalog ai
 JOIN pg_class     c  ON c.oid       = ai.relid
 JOIN pg_class     ic ON ic.oid      = ai.indexrelid
-JOIN pg_attribute a  ON a.attrelid  = ai.relid AND a.attnum = ai.attno
 WHERE c.relname = 'drop_test'
 ORDER BY ai.created_at;
 SQL

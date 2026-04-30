@@ -5,8 +5,10 @@
 #include "access/attnum.h"
 #include "storage/lwlock.h"
 
-#define AUTO_INDEX_MAX_TABLES	256
-#define AUTO_INDEX_MAX_COLS		32
+#define AUTO_INDEX_MAX_TABLES		256
+#define AUTO_INDEX_MAX_COLS			32
+#define AUTO_INDEX_MAX_COLSETS		16
+#define AUTO_INDEX_COLSET_MAX_COLS	3
 
 typedef struct AutoIndexColumnStats
 {
@@ -15,6 +17,22 @@ typedef struct AutoIndexColumnStats
 	int64		range_hits;				/* current interval */
 	int64		cumulative_benefit;		/* ski rental: accumulated across intervals */
 } AutoIndexColumnStats;
+
+/*
+ * A column set observed together in a single query's predicate list.
+ * The attnos[] are sorted ascending — that gives a stable lookup key.
+ * Column ORDER for the actual CREATE INDEX is decided at create time
+ * (equality columns first, then range, by attno within group).
+ */
+typedef struct AutoIndexColSet
+{
+	int8		n_cols;								/* 0 = empty slot, 2 or 3 used */
+	AttrNumber	attnos[AUTO_INDEX_COLSET_MAX_COLS];	/* sorted ascending */
+	int8		ops[AUTO_INDEX_COLSET_MAX_COLS];	/* 0=eq, 1=range, parallel to attnos */
+	uint64		last_access_tick;
+	int64		hits;								/* current interval */
+	int64		cumulative_benefit;					/* ski rental accumulator */
+} AutoIndexColSet;
 
 typedef struct AutoIndexTableStats
 {
@@ -25,6 +43,7 @@ typedef struct AutoIndexTableStats
 	int64					delete_count;			/* current interval */
 	int64					cumulative_write_cost;	/* accumulated across intervals */
 	AutoIndexColumnStats	columns[AUTO_INDEX_MAX_COLS];
+	AutoIndexColSet			colsets[AUTO_INDEX_MAX_COLSETS];
 } AutoIndexTableStats;
 
 typedef struct AutoIndexSharedState
