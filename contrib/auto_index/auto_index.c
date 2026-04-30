@@ -6,6 +6,7 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
+#include "nodes/parsenodes.h"
 #include "nodes/plannodes.h"
 #include "nodes/primnodes.h"
 #include "postmaster/bgworker.h"
@@ -16,10 +17,12 @@
 #include "storage/shmem.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/wait_event.h"
+#include "funcapi.h"
 
 #include "auto_index.h"
 
@@ -320,6 +323,40 @@ walk_plan_state(PlanState *node)
 static void
 auto_index_executor_end(QueryDesc *queryDesc)
 {
+	/* Write tracking */
+	if (auto_index_state != NULL &&
+		(queryDesc->operation == CMD_INSERT ||
+		 queryDesc->operation == CMD_UPDATE ||
+		 queryDesc->operation == CMD_DELETE))
+	{
+		PlannedStmt *pstmt = queryDesc->plannedstmt;
+
+		if (pstmt->resultRelationRelids != NULL)
+		{
+			int				rtindex = bms_next_member(pstmt->resultRelationRelids, -1);
+			RangeTblEntry  *rte = (rtindex > 0)
+				? (RangeTblEntry *) list_nth(pstmt->rtable, rtindex - 1)
+				: NULL;
+			Oid				relid = (rte != NULL) ? rte->relid : InvalidOid;
+
+			if (OidIsValid(relid))
+			{
+				int tslot;
+
+				LWLockAcquire(auto_index_state->lock, LW_EXCLUSIVE);
+				tslot = find_table_slot(relid);
+				if (queryDesc->operation == CMD_INSERT)
+					auto_index_state->tables[tslot].insert_count++;
+				else if (queryDesc->operation == CMD_UPDATE)
+					auto_index_state->tables[tslot].update_count++;
+				else
+					auto_index_state->tables[tslot].delete_count++;
+				LWLockRelease(auto_index_state->lock);
+			}
+		}
+	}
+
+	/* Read tracking */
 	if (auto_index_state != NULL && queryDesc->planstate != NULL)
 		walk_plan_state(queryDesc->planstate);
 
@@ -327,6 +364,138 @@ auto_index_executor_end(QueryDesc *queryDesc)
 		prev_ExecutorEnd(queryDesc);
 	else
 		standard_ExecutorEnd(queryDesc);
+}
+
+
+/* -------------------------------------------------------------------------
+ * SQL-callable functions
+ * -------------------------------------------------------------------------
+ */
+
+PG_FUNCTION_INFO_V1(auto_index_reset);
+Datum
+auto_index_reset(PG_FUNCTION_ARGS)
+{
+	if (auto_index_state == NULL)
+		ereport(ERROR,
+				(errmsg("auto_index shared memory not initialised — "
+						"is auto_index in shared_preload_libraries?")));
+
+	LWLockAcquire(auto_index_state->lock, LW_EXCLUSIVE);
+	memset(auto_index_state->tables, 0,
+		   sizeof(auto_index_state->tables));
+	auto_index_state->access_counter = 0;
+	auto_index_state->generation++;
+	LWLockRelease(auto_index_state->lock);
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * auto_index_stats() — SRF returning one row per tracked (table, column) pair.
+ *
+ * We snapshot shared memory on the first call, store it in FuncCallContext,
+ * then iterate across all table×column combinations across subsequent calls.
+ */
+
+typedef struct StatsScanState
+{
+	/* local snapshot taken under the lock */
+	AutoIndexTableStats tables[AUTO_INDEX_MAX_TABLES];
+	/* current position */
+	int		tslot;
+	int		cslot;
+} StatsScanState;
+
+PG_FUNCTION_INFO_V1(auto_index_stats);
+Datum
+auto_index_stats(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	StatsScanState  *scan;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		MemoryContext oldctx;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldctx  = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		if (auto_index_state == NULL)
+			ereport(ERROR,
+					(errmsg("auto_index shared memory not initialised — "
+							"is auto_index in shared_preload_libraries?")));
+
+		scan = palloc(sizeof(StatsScanState));
+		LWLockAcquire(auto_index_state->lock, LW_SHARED);
+		memcpy(scan->tables, auto_index_state->tables,
+			   sizeof(scan->tables));
+		LWLockRelease(auto_index_state->lock);
+		scan->tslot = 0;
+		scan->cslot = 0;
+
+		funcctx->user_fctx = scan;
+
+		/* Derive tuple descriptor from the function's declared OUT parameters */
+		{
+			TupleDesc tupdesc;
+
+			if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+				ereport(ERROR,
+						(errmsg("auto_index_stats: return type must be composite")));
+			funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+		}
+
+		MemoryContextSwitchTo(oldctx);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	scan    = (StatsScanState *) funcctx->user_fctx;
+
+	/* Advance to the next non-empty column slot */
+	while (scan->tslot < AUTO_INDEX_MAX_TABLES)
+	{
+		AutoIndexTableStats  *t = &scan->tables[scan->tslot];
+		AutoIndexColumnStats *c;
+
+		if (!OidIsValid(t->relation_id))
+		{
+			scan->tslot++;
+			scan->cslot = 0;
+			continue;
+		}
+
+		if (scan->cslot >= AUTO_INDEX_MAX_COLS)
+		{
+			scan->tslot++;
+			scan->cslot = 0;
+			continue;
+		}
+
+		c = &t->columns[scan->cslot];
+		scan->cslot++;
+
+		if (!AttrNumberIsForUserDefinedAttr(c->attribute_number))
+			continue;
+		if (c->equality_hits == 0 && c->range_hits == 0)
+			continue;
+
+		{
+			Datum		values[4];
+			bool		nulls[4] = {false, false, false, false};
+			HeapTuple	tuple;
+
+			values[0] = ObjectIdGetDatum(t->relation_id);
+			values[1] = Int16GetDatum(c->attribute_number);
+			values[2] = Int64GetDatum(c->equality_hits);
+			values[3] = Int64GetDatum(c->range_hits);
+
+			tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+			SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+		}
+	}
+
+	SRF_RETURN_DONE(funcctx);
 }
 
 
@@ -438,39 +607,12 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 	{
 		AutoIndexTableStats *t = &snapshot[i];
 		int64	write_cost;
-		bool	isnull;
 		int		ret;
 
 		if (!OidIsValid(t->relation_id))
 			continue;
 
-		/* Get write counts from pg_stat_user_tables */
-		{
-			Oid		argtypes[1] = {OIDOID};
-			Datum	args[1]		= {ObjectIdGetDatum(t->relation_id)};
-			char	nulls[1]	= {' '};
-			int64	ins, upd, del, hot;
-
-			ret = SPI_execute_with_args(
-				"SELECT n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd "
-				"FROM pg_stat_user_tables WHERE relid = $1",
-				1, argtypes, args, nulls, true, 1);
-
-			if (ret != SPI_OK_SELECT || SPI_processed == 0)
-				continue;
-
-			ins = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-											  SPI_tuptable->tupdesc, 1, &isnull));
-			upd = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-											  SPI_tuptable->tupdesc, 2, &isnull));
-			del = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-											  SPI_tuptable->tupdesc, 3, &isnull));
-			hot = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-											  SPI_tuptable->tupdesc, 4, &isnull));
-
-			/* HOT updates don't touch index pages, so exclude them */
-			write_cost = ins + del + Max(0, upd - hot);
-		}
+		write_cost = t->insert_count + t->update_count + t->delete_count;
 
 		/* CREATE candidates: columns with predicate hits and no existing index */
 		for (c = 0; c < AUTO_INDEX_MAX_COLS && n_create < MAX_DECISIONS; c++)
@@ -628,13 +770,18 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 	CommitTransactionCommand();
 
 	/* ------------------------------------------------------------------
-	 * Phase 2: execute DDL in non-atomic SPI context
+	 * Phase 2: one transaction per DDL statement.
+	 *
+	 * CREATE/DROP INDEX CONCURRENTLY cannot run inside any SPI context
+	 * (atomic or non-atomic) in a bgworker because the CONCURRENTLY path
+	 * internally commits and restarts transactions, which confuses the SPI
+	 * snapshot stack.  Regular CREATE/DROP INDEX is used instead; it takes
+	 * a short ShareLock during the build which is acceptable for the tables
+	 * and workloads this extension targets.
 	 * ------------------------------------------------------------------
 	 */
 	if (n_create == 0 && n_drop == 0)
 		return;
-
-	SPI_connect_ext(SPI_OPT_NONATOMIC);
 
 	for (i = 0; i < n_create; i++)
 	{
@@ -642,51 +789,62 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 		char	sql[1024];
 
 		snprintf(sql, sizeof(sql),
-				 "CREATE INDEX CONCURRENTLY IF NOT EXISTS %s ON %s.%s (%s)",
+				 "CREATE INDEX IF NOT EXISTS %s ON %s.%s (%s)",
 				 d->idxname, d->schema, d->relname, d->attname);
 
 		PG_TRY();
 		{
+			SetCurrentStatementStartTimestamp();
+			StartTransactionCommand();
+			SPI_connect();
+			PushActiveSnapshot(GetTransactionSnapshot());
+
 			SPI_execute(sql, false, 0);
 
-			/* Record in catalog */
+			/* Record in catalog using INSERT...SELECT to avoid a separate
+			 * OID lookup — the index is visible in pg_class within the same
+			 * transaction so this finds it and inserts in one statement. */
 			{
-				Oid		argtypes[3] = {OIDOID, OIDOID, INT2OID};
-				Datum	args[3];
+				Oid		argtypes[3] = {OIDOID, INT2OID, NAMEOID};
+				Datum	args[3]		= {ObjectIdGetDatum(d->relid),
+									   Int16GetDatum(d->attno),
+									   DirectFunctionCall1(namein,
+										   CStringGetDatum(d->idxname))};
 				char	nulls[3]	= {' ', ' ', ' '};
-				char	find_sql[256];
-				int		ret;
 
-				snprintf(find_sql, sizeof(find_sql),
-						 "SELECT oid FROM pg_class WHERE relname = '%s' "
-						 "AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '%s')",
-						 d->idxname, d->schema);
-
-				ret = SPI_execute(find_sql, true, 1);
-				if (ret == SPI_OK_SELECT && SPI_processed > 0)
-				{
-					bool	isnull;
-					Oid		indexrelid = DatumGetObjectId(
-						SPI_getbinval(SPI_tuptable->vals[0],
-									  SPI_tuptable->tupdesc, 1, &isnull));
-
-					args[0] = ObjectIdGetDatum(d->relid);
-					args[1] = ObjectIdGetDatum(indexrelid);
-					args[2] = Int16GetDatum(d->attno);
-
-					SPI_execute_with_args(
-						"INSERT INTO auto_index_catalog "
-						"(relid, indexrelid, attno, created_at, last_checked_idx_scan) "
-						"VALUES ($1, $2, $3, now(), 0) ON CONFLICT DO NOTHING",
-						3, argtypes, args, nulls, false, 0);
-				}
+				/* Use -1 as the initial baseline so the first DROP evaluation
+				 * sees cur_scan(0) != last_scan(-1) and skips the drop.
+				 * Only after one full interval with no usage will it drop. */
+				SPI_execute_with_args(
+					"INSERT INTO auto_index_catalog "
+					"    (relid, indexrelid, attno, created_at, last_checked_idx_scan) "
+					"SELECT $1, c.oid, $2, now(), -1 "
+					"FROM   pg_class c "
+					"JOIN   pg_namespace n ON n.oid = c.relnamespace "
+					"WHERE  c.relname = $3 AND n.nspname = 'public' "
+					"ON CONFLICT DO NOTHING",
+					3, argtypes, args, nulls, false, 0);
 			}
+
+			PopActiveSnapshot();
+			SPI_finish();
+			CommitTransactionCommand();
+
+			elog(LOG, "auto_index: created index %s on %s.%s (%s)",
+				 d->idxname, d->schema, d->relname, d->attname);
 		}
 		PG_CATCH();
 		{
-			/* Log the error but keep going — one failed CREATE shouldn't stop the rest */
-			elog(WARNING, "auto_index: failed to create index %s: %m", d->idxname);
+			ErrorData  *edata;
+			MemoryContext oldctx = MemoryContextSwitchTo(TopMemoryContext);
+
+			edata = CopyErrorData();
+			MemoryContextSwitchTo(oldctx);
+			elog(WARNING, "auto_index: failed to create index %s: %s",
+				 d->idxname, edata->message);
+			FreeErrorData(edata);
 			FlushErrorState();
+			AbortCurrentTransaction();
 		}
 		PG_END_TRY();
 	}
@@ -697,11 +855,16 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 		char	sql[512];
 
 		snprintf(sql, sizeof(sql),
-				 "DROP INDEX CONCURRENTLY IF EXISTS %s.%s",
+				 "DROP INDEX IF EXISTS %s.%s",
 				 d->schema, d->idxname);
 
 		PG_TRY();
 		{
+			SetCurrentStatementStartTimestamp();
+			StartTransactionCommand();
+			SPI_connect();
+			PushActiveSnapshot(GetTransactionSnapshot());
+
 			SPI_execute(sql, false, 0);
 
 			/* Remove from catalog */
@@ -714,19 +877,32 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 					"DELETE FROM auto_index_catalog WHERE indexrelid = $1",
 					1, argtypes, args, nulls, false, 0);
 			}
+
+			PopActiveSnapshot();
+			SPI_finish();
+			CommitTransactionCommand();
+
+			elog(LOG, "auto_index: dropped index %s.%s",
+				 d->schema, d->idxname);
 		}
 		PG_CATCH();
 		{
-			elog(WARNING, "auto_index: failed to drop index %s: %m", d->idxname);
+			ErrorData  *edata;
+			MemoryContext oldctx = MemoryContextSwitchTo(TopMemoryContext);
+
+			edata = CopyErrorData();
+			MemoryContextSwitchTo(oldctx);
+			elog(WARNING, "auto_index: failed to drop index %s: %s",
+				 d->idxname, edata->message);
+			FreeErrorData(edata);
 			FlushErrorState();
+			AbortCurrentTransaction();
 		}
 		PG_END_TRY();
 	}
-
-	SPI_finish();
 }
 
-void
+PGDLLEXPORT void
 auto_index_main(Datum main_arg)
 {
 	BackgroundWorkerInitializeConnection("postgres", NULL, 0);
@@ -769,5 +945,29 @@ auto_index_main(Datum main_arg)
 		PG_END_TRY();
 
 		pfree(snapshot);
+
+		/* Reset interval counters so the next pass measures only what happens
+		 * after this point.  Slot identity (relation_id, last_access_tick) and
+		 * column attribute numbers are bookkeeping, not measurements — leave them. */
+		{
+			int		si,
+					ci;
+
+			LWLockAcquire(auto_index_state->lock, LW_EXCLUSIVE);
+			for (si = 0; si < AUTO_INDEX_MAX_TABLES; si++)
+			{
+				AutoIndexTableStats *t = &auto_index_state->tables[si];
+
+				t->insert_count = 0;
+				t->update_count = 0;
+				t->delete_count = 0;
+				for (ci = 0; ci < AUTO_INDEX_MAX_COLS; ci++)
+				{
+					t->columns[ci].equality_hits = 0;
+					t->columns[ci].range_hits    = 0;
+				}
+			}
+			LWLockRelease(auto_index_state->lock);
+		}
 	}
 }

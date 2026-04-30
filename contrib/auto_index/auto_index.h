@@ -19,6 +19,9 @@ typedef struct AutoIndexTableStats
 {
 	Oid						relation_id;
 	uint64					last_access_tick;
+	int64					insert_count;
+	int64					update_count;
+	int64					delete_count;
 	AutoIndexColumnStats	columns[AUTO_INDEX_MAX_COLS];
 } AutoIndexTableStats;
 
@@ -38,7 +41,7 @@ extern double	auto_index_threshold;
 extern int		auto_index_check_interval;
 extern int		auto_index_max_indexes_per_table;
 
-/* Background worker entry point */
-extern void auto_index_main(Datum main_arg);
+/* Background worker entry point — must be exported so bgworker machinery can find it */
+extern PGDLLEXPORT void auto_index_main(Datum main_arg);
 
 #endif							/* AUTO_INDEX_H */
