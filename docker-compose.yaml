@@ -1,0 +1,9 @@
+services:
+  pg-dev:
+    build: .
+    container_name: postgres-dev
+    volumes:
+      - .:/postgres
+    working_dir: /postgres
+    tty: true
+    stdin_open: true
