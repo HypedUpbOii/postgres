@@ -6,7 +6,8 @@ CREATE TABLE auto_index_catalog (
     attno                   smallint        NOT NULL,
     created_at              timestamptz     NOT NULL DEFAULT now(),
     last_checked_idx_scan   bigint          NOT NULL DEFAULT 0,
-    last_checked_at         timestamptz
+    last_checked_at         timestamptz,
+    idle_write_cost         bigint          NOT NULL DEFAULT 0
 );
 
 CREATE FUNCTION auto_index_stats(

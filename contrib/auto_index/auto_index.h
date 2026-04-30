@@ -6,22 +6,24 @@
 #include "storage/lwlock.h"
 
 #define AUTO_INDEX_MAX_TABLES	256
-#define AUTO_INDEX_MAX_COLS		16
+#define AUTO_INDEX_MAX_COLS		32
 
 typedef struct AutoIndexColumnStats
 {
 	AttrNumber	attribute_number;
-	int64		equality_hits;
-	int64		range_hits;
+	int64		equality_hits;			/* current interval */
+	int64		range_hits;				/* current interval */
+	int64		cumulative_benefit;		/* ski rental: accumulated across intervals */
 } AutoIndexColumnStats;
 
 typedef struct AutoIndexTableStats
 {
 	Oid						relation_id;
 	uint64					last_access_tick;
-	int64					insert_count;
-	int64					update_count;
-	int64					delete_count;
+	int64					insert_count;			/* current interval */
+	int64					update_count;			/* current interval */
+	int64					delete_count;			/* current interval */
+	int64					cumulative_write_cost;	/* accumulated across intervals */
 	AutoIndexColumnStats	columns[AUTO_INDEX_MAX_COLS];
 } AutoIndexTableStats;
 
