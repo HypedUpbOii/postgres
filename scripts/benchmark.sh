@@ -1,0 +1,93 @@
+#!/bin/bash
+#
+# Run benchmarks against auto_index.
+#
+# Usage: scripts/benchmark.sh <bench> [args...]
+#
+#   pgbench                   Live pgbench demo — watch TPS jump when
+#                             auto_index creates the index mid-run.
+#   tpch [setup]              TPC-H 3-phase benchmark (baseline / training
+#                             / indexed).  Auto-runs setup if data missing.
+#                             "tpch setup" forces a re-load.
+#   tpcc                      TPC-C-lite OLTP benchmark.
+#   strategies                All create-strategies compared on TPC-H,
+#                             single comparison table at the end.
+#
+# Tunables (env vars, all benchmarks):
+#   ITERATIONS=1              per-query repetitions (median taken)
+#   CHECK_INTERVAL=5          bgworker wake interval
+#   THRESHOLD=2               auto_index.threshold
+#   SIMPLE_THRESHOLD=5        auto_index.simple_threshold
+#   WAIT_FOR_BGWORKER=20      seconds to wait after training
+#
+# Per-benchmark tunables:
+#   pgbench:  ROWS, DURATION, CLIENTS, JOBS, PROGRESS
+#   tpch:     SF (scale factor 0.1 / 1 / 10), TRAINING_PASSES
+#   tpcc:     SCALE, DURATION_S, TRAINING_S, CLIENTS, JOBS, STRATEGY
+#
+# Examples:
+#   scripts/benchmark.sh pgbench
+#   SF=1 scripts/benchmark.sh tpch
+#   STRATEGY=ratio_only scripts/benchmark.sh tpcc
+#   scripts/benchmark.sh strategies
+#
+set -e
+
+BENCH="${1:-help}"
+CONTAINER="pg-dev"
+LIB="/postgres/scripts/lib"
+shift || true
+
+# Forward all the env-var tunables a benchmark might use.
+ENV_FORWARD=(
+    -e ITERATIONS -e CHECK_INTERVAL -e THRESHOLD -e SIMPLE_THRESHOLD
+    -e MIN_TABLE_ROWS -e WAIT_FOR_BGWORKER -e BASELINE_THRESHOLD
+    -e TRAINING_PASSES
+    # pgbench
+    -e ROWS -e DURATION -e CLIENTS -e JOBS -e PROGRESS
+    # tpch
+    -e SF -e DBGEN_REPO -e FORCE_RELOAD
+    # tpcc
+    -e SCALE -e DURATION_S -e TRAINING_S -e STRATEGY
+    # strategies
+    -e STRATEGIES
+)
+
+case "$BENCH" in
+    help|"")
+        sed -n '3,30p' "$0"
+        ;;
+    pgbench)
+        docker compose exec "${ENV_FORWARD[@]}" "$CONTAINER" \
+            bash "$LIB/bench_pgbench.sh"
+        ;;
+    tpch)
+        # Optional sub-command: "setup" forces re-load.
+        if [ "$1" = "setup" ]; then
+            FORCE_RELOAD=1 docker compose exec "${ENV_FORWARD[@]}" \
+                "$CONTAINER" bash "$LIB/tpch_setup.sh"
+            exit 0
+        fi
+        # Auto-setup if no data, then benchmark.
+        docker compose exec "${ENV_FORWARD[@]}" "$CONTAINER" \
+            bash "$LIB/tpch_setup.sh"
+        docker compose exec "${ENV_FORWARD[@]}" "$CONTAINER" \
+            bash "$LIB/bench_tpch.sh"
+        ;;
+    tpcc)
+        docker compose exec "${ENV_FORWARD[@]}" "$CONTAINER" \
+            bash "$LIB/bench_tpcc.sh"
+        ;;
+    strategies)
+        # Strategies runs against TPC-H — auto-setup first.
+        docker compose exec "${ENV_FORWARD[@]}" "$CONTAINER" \
+            bash "$LIB/tpch_setup.sh"
+        docker compose exec "${ENV_FORWARD[@]}" "$CONTAINER" \
+            bash "$LIB/bench_strategies.sh"
+        ;;
+    *)
+        echo "Unknown benchmark: $BENCH" >&2
+        echo "Run '$0 help' for usage." >&2
+        exit 1
+        ;;
+esac

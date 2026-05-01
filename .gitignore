@@ -45,3 +45,15 @@ logfile
 /tmp_install/
 /portlock/
 /data/
+
+# auto_index-project local artifacts (see scripts/lib/tpch_setup.sh).
+# tpch/ holds the cloned tpch-dbgen tool plus any generated SF=*.tbl
+# data — regenerated on demand, no reason to track it.
+/scripts/lib/tpch/
+/.codex
+
+# LaTeX build artifacts for report/report.tex (keep .tex and .pdf).
+/report/*.aux
+/report/*.log
+/report/*.out
+/report/*.toc

@@ -1,3 +1,16 @@
+/*
+ * auto_index — automatic index creation/deletion for PostgreSQL.
+ *
+ * The file is split into six sections — search for these markers to jump:
+ *
+ *   1. MODULE INIT & GUCs
+ *   2. SHARED MEMORY      — shmem layout, hooks, slot allocators
+ *   3. PARSING            — executor hook, qual extraction
+ *   4. STRATEGIES         — decide_create_* family + dispatcher
+ *   5. INDEX MANAGEMENT   — bgworker, evaluate_and_manage_indexes, DDL
+ *   6. SQL-CALLABLE       — auto_index_reset, auto_index_stats SRF
+ */
+
 #include "postgres.h"
 
 #include <math.h>
@@ -33,33 +46,30 @@
 
 PG_MODULE_MAGIC;
 
+
+/* ============================================================================
+ * 1. MODULE INIT & GUCs
+ * ============================================================================ */
+
 AutoIndexSharedState *auto_index_state = NULL;
 
-/* GUC variables */
-double	auto_index_threshold			= 10.0;
-int		auto_index_check_interval		= 300;
+double	auto_index_threshold			 = 10.0;
+int		auto_index_check_interval		 = 300;
 int		auto_index_max_indexes_per_table = 6;
 
-/*
- * Selectable create-decision strategy.  Default preserves the existing
- * ski-rental behaviour exactly; other values dispatch to the alternative
- * decide_create_* functions defined below.
- */
 typedef enum AutoIndexCreateStrategy
 {
-	AI_CREATE_SKI_RENTAL = 0,		/* current default */
+	AI_CREATE_SKI_RENTAL = 0,
 	AI_CREATE_SIMPLE_THRESHOLD,
 	AI_CREATE_RATIO_ONLY,
 	AI_CREATE_COST_GAIN,
 	AI_CREATE_SIZE_GATED,
-	AI_CREATE_ALWAYS,				/* fire on any cumulative_benefit > 0 */
+	AI_CREATE_ALWAYS,
 } AutoIndexCreateStrategy;
 
-int		auto_index_create_strategy		 = AI_CREATE_SKI_RENTAL;
-
-/* Tunables for the alternative strategies — unused by ski_rental. */
-double	auto_index_simple_threshold		 = 100.0;	/* "simple_threshold", "size_gated" */
-double	auto_index_min_table_rows		 = 1000.0;	/* "size_gated" floor */
+int		auto_index_create_strategy	= AI_CREATE_SKI_RENTAL;
+double	auto_index_simple_threshold	= 100.0;	/* simple_threshold, size_gated */
+double	auto_index_min_table_rows	= 1000.0;	/* size_gated floor */
 
 static const struct config_enum_entry auto_index_create_strategy_options[] = {
 	{"ski_rental",		 AI_CREATE_SKI_RENTAL,		 false},
@@ -71,12 +81,11 @@ static const struct config_enum_entry auto_index_create_strategy_options[] = {
 	{NULL, 0, false},
 };
 
-/* Saved previous hook values — always chain, never discard */
+/* Always chain hooks — never discard a previous handler. */
 static ExecutorEnd_hook_type	prev_ExecutorEnd	= NULL;
 static shmem_request_hook_type	prev_shmem_request	= NULL;
 static shmem_startup_hook_type	prev_shmem_startup	= NULL;
 
-/* Forward declarations */
 static void auto_index_shmem_request(void);
 static void auto_index_shmem_startup(void);
 static void auto_index_executor_end(QueryDesc *queryDesc);
@@ -89,12 +98,6 @@ static int	find_colset_slot(int tslot, const AttrNumber *attnos,
 static void evaluate_and_manage_indexes(AutoIndexTableStats *snapshot);
 
 void _PG_init(void);
-
-
-/* -------------------------------------------------------------------------
- * Module init
- * -------------------------------------------------------------------------
- */
 
 void
 _PG_init(void)
@@ -164,20 +167,20 @@ _PG_init(void)
 
 	MarkGUCPrefixReserved("auto_index");
 
-	prev_shmem_request = shmem_request_hook;
-	shmem_request_hook = auto_index_shmem_request;
+	prev_shmem_request	 = shmem_request_hook;
+	shmem_request_hook	 = auto_index_shmem_request;
 
-	prev_shmem_startup = shmem_startup_hook;
-	shmem_startup_hook = auto_index_shmem_startup;
+	prev_shmem_startup	 = shmem_startup_hook;
+	shmem_startup_hook	 = auto_index_shmem_startup;
 
-	prev_ExecutorEnd = ExecutorEnd_hook;
-	ExecutorEnd_hook = auto_index_executor_end;
+	prev_ExecutorEnd	 = ExecutorEnd_hook;
+	ExecutorEnd_hook	 = auto_index_executor_end;
 
 	memset(&worker, 0, sizeof(worker));
-	snprintf(worker.bgw_name,		  BGW_MAXLEN, "auto_index worker");
-	snprintf(worker.bgw_type,		  BGW_MAXLEN, "auto_index");
-	snprintf(worker.bgw_library_name, MAXPGPATH,  "auto_index");
-	snprintf(worker.bgw_function_name,BGW_MAXLEN, "auto_index_main");
+	snprintf(worker.bgw_name,		   BGW_MAXLEN, "auto_index worker");
+	snprintf(worker.bgw_type,		   BGW_MAXLEN, "auto_index");
+	snprintf(worker.bgw_library_name,  MAXPGPATH,  "auto_index");
+	snprintf(worker.bgw_function_name, BGW_MAXLEN, "auto_index_main");
 	worker.bgw_flags		= BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time	= BgWorkerStart_RecoveryFinished;
 	worker.bgw_restart_time = 10;
@@ -185,10 +188,12 @@ _PG_init(void)
 }
 
 
-/* -------------------------------------------------------------------------
- * Shared memory
- * -------------------------------------------------------------------------
- */
+/* ============================================================================
+ * 2. SHARED MEMORY
+ *
+ * Hook registration plus LRU slot allocators for tables, columns, and
+ * colsets.  All slot helpers must be called under LW_EXCLUSIVE.
+ * ============================================================================ */
 
 static void
 auto_index_shmem_request(void)
@@ -218,16 +223,6 @@ auto_index_shmem_startup(void)
 	}
 }
 
-
-/* -------------------------------------------------------------------------
- * LRU slot management — both functions must be called under LW_EXCLUSIVE
- * -------------------------------------------------------------------------
- */
-
-/*
- * Find or allocate a table slot for relid.  On a miss, evicts the LRU
- * entry when all slots are full.  Returns the slot index.
- */
 static int
 find_table_slot(Oid relid)
 {
@@ -256,15 +251,11 @@ find_table_slot(Oid relid)
 
 	i = (empty_slot != -1) ? empty_slot : lru_slot;
 	memset(&auto_index_state->tables[i], 0, sizeof(AutoIndexTableStats));
-	auto_index_state->tables[i].relation_id		  = relid;
+	auto_index_state->tables[i].relation_id		 = relid;
 	auto_index_state->tables[i].last_access_tick = ++auto_index_state->access_counter;
 	return i;
 }
 
-/*
- * Find or allocate a column slot for attno inside table slot tslot.
- * Returns the column slot index, or -1 if all column slots are full.
- */
 static int
 find_col_slot(int tslot, AttrNumber attno)
 {
@@ -282,19 +273,13 @@ find_col_slot(int tslot, AttrNumber attno)
 	}
 
 	if (empty_slot == -1)
-		return -1;				/* all column slots occupied — drop this stat */
+		return -1;					/* all slots full — drop this stat */
 
 	auto_index_state->tables[tslot].columns[empty_slot].attribute_number = attno;
 	return empty_slot;
 }
 
-/*
- * Find or allocate a colset slot for (sorted attnos, ops) inside table
- * slot tslot.  attnos must already be sorted ascending; ops must be in
- * the same order as attnos.  Returns -1 if all slots are full and no
- * LRU-evictable slot exists (shouldn't happen given LRU fallback, but
- * defensive).
- */
+/* attnos must be sorted ascending; ops aligned with attnos. */
 static int
 find_colset_slot(int tslot, const AttrNumber *attnos,
 				 const int8 *ops, int n_cols)
@@ -335,7 +320,7 @@ find_colset_slot(int tslot, const AttrNumber *attnos,
 
 	i = (empty_slot != -1) ? empty_slot : lru_slot;
 	if (i < 0)
-		return -1;					/* defensive */
+		return -1;
 
 	memset(&slots[i], 0, sizeof(AutoIndexColSet));
 	slots[i].n_cols = (int8) n_cols;
@@ -349,24 +334,24 @@ find_colset_slot(int tslot, const AttrNumber *attnos,
 }
 
 
-/* -------------------------------------------------------------------------
- * Executor hook — SeqScan qual extraction
- * -------------------------------------------------------------------------
- */
+/* ============================================================================
+ * 3. PARSING
+ *
+ * ExecutorEnd hook fires on every query.  walk_plan_state finds SeqScan
+ * nodes; process_seqscan extracts predicates from the qual tree into a
+ * local QualSet (recursing through BoolExpr, ScalarArrayOpExpr, OpExpr,
+ * peeling RelabelType casts), then under the lock bumps both the
+ * singleton hit counters and — if 2-3 distinct user-attrs were observed
+ * — the matching multi-column colset slot.
+ * ============================================================================ */
 
-/*
- * Local accumulator: tracks the predicates observed in a single query's
- * qual list.  We collect first, then bump shared-memory counters under
- * the lock — that gives us a clean view of "these N columns appeared
- * together" which is what colset tracking needs.
- */
+#define LOCAL_PRED_MAX	16
+
 typedef struct LocalPred
 {
 	AttrNumber	attno;
 	int8		op;					/* 0 = equality, 1 = range */
 } LocalPred;
-
-#define LOCAL_PRED_MAX	16			/* per-query distinct attrs we track */
 
 typedef struct QualSet
 {
@@ -374,8 +359,7 @@ typedef struct QualSet
 	int			n_preds;
 } QualSet;
 
-/* Add (attno, op) to qs, deduplicating by attno.  Equality wins over range
- * if the same column appears with both kinds of predicates. */
+/* Equality wins when the same column appears with both kinds of preds. */
 static void
 qualset_add(QualSet *qs, AttrNumber attno, int8 op)
 {
@@ -389,7 +373,7 @@ qualset_add(QualSet *qs, AttrNumber attno, int8 op)
 		if (qs->preds[i].attno == attno)
 		{
 			if (op == 0)
-				qs->preds[i].op = 0;	/* upgrade range -> eq */
+				qs->preds[i].op = 0;
 			return;
 		}
 	}
@@ -400,11 +384,7 @@ qualset_add(QualSet *qs, AttrNumber attno, int8 op)
 	qs->n_preds++;
 }
 
-/*
- * Peel implicit-cast wrappers off an expression so the underlying Var
- * (if any) becomes visible.  RelabelType is the most common — it appears
- * around `col::text = 'x'` style predicates.
- */
+/* Peel implicit-cast wrappers (RelabelType from `col::text = 'x'` etc.). */
 static Expr *
 strip_implicit_casts(Expr *e)
 {
@@ -413,10 +393,6 @@ strip_implicit_casts(Expr *e)
 	return e;
 }
 
-/*
- * Convert a postgres operator name to our 0=eq / 1=range encoding.
- * Returns -1 if the operator is something we don't track.
- */
 static int8
 opname_to_op(const char *opname)
 {
@@ -428,18 +404,13 @@ opname_to_op(const char *opname)
 	return -1;
 }
 
-/*
- * Walk one expression node and accumulate every column predicate we can
- * recognise into qs.  Recurses into BoolExpr (AND/OR/NOT) so quals
- * nested inside disjunctions (e.g. TPC-H Q19) are still observed.
- */
+/* Recurses into BoolExpr so quals nested in OR/AND (TPC-H Q19) are seen. */
 static void
 process_qual_node(QualSet *qs, Expr *expr)
 {
 	if (expr == NULL)
 		return;
 
-	/* AND / OR / NOT — recurse into each child. */
 	if (IsA(expr, BoolExpr))
 	{
 		BoolExpr   *b = (BoolExpr *) expr;
@@ -450,7 +421,6 @@ process_qual_node(QualSet *qs, Expr *expr)
 		return;
 	}
 
-	/* col IN (...)  /  col = ANY(array)  — treat as equality observation. */
 	if (IsA(expr, ScalarArrayOpExpr))
 	{
 		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) expr;
@@ -476,7 +446,6 @@ process_qual_node(QualSet *qs, Expr *expr)
 		return;
 	}
 
-	/* Var <op> Const  /  Const <op> Var */
 	if (IsA(expr, OpExpr))
 	{
 		OpExpr	   *opx = (OpExpr *) expr;
@@ -508,17 +477,12 @@ process_qual_node(QualSet *qs, Expr *expr)
 			return;
 
 		qualset_add(qs, attno, op);
-		return;
 	}
 
-	/*
-	 * Other node types (FuncExpr casts, NullTest, CaseExpr, SubPlan, ...)
-	 * — silently ignore.
-	 */
+	/* FuncExpr casts, NullTest, CaseExpr, SubPlan, ... — silently ignored. */
 }
 
-/* Stable sort qs->preds by attno ascending — small N, insertion sort.
- * Used to derive the canonical lookup key for find_colset_slot. */
+/* Insertion sort by attno (small N).  Result is the colset lookup key. */
 static void
 qualset_sort_by_attno(QualSet *qs)
 {
@@ -536,33 +500,25 @@ qualset_sort_by_attno(QualSet *qs)
 	}
 }
 
-/* If we observed > AUTO_INDEX_COLSET_MAX_COLS user-attrs, reduce qs in
- * place to the top AUTO_INDEX_COLSET_MAX_COLS — equality preferred,
- * then by attno ascending.  Result is still sorted by attno. */
+/* If we observed > AUTO_INDEX_COLSET_MAX_COLS attrs, keep the top N
+ * (equality preferred, then attno) so a colset entry is still bumped. */
 static void
 qualset_trim_to_max(QualSet *qs)
 {
 	int		i, j;
-	int		eq_count = 0;
 	LocalPred picked[AUTO_INDEX_COLSET_MAX_COLS];
 	int		n_picked = 0;
 
 	if (qs->n_preds <= AUTO_INDEX_COLSET_MAX_COLS)
 		return;
 
-	/* Pass 1: take equality preds first. */
 	for (i = 0; i < qs->n_preds && n_picked < AUTO_INDEX_COLSET_MAX_COLS; i++)
 		if (qs->preds[i].op == 0)
-		{
 			picked[n_picked++] = qs->preds[i];
-			eq_count++;
-		}
-	/* Pass 2: top up with range preds if we have room. */
 	for (i = 0; i < qs->n_preds && n_picked < AUTO_INDEX_COLSET_MAX_COLS; i++)
 		if (qs->preds[i].op == 1)
 			picked[n_picked++] = qs->preds[i];
 
-	/* Re-sort the picked ones by attno. */
 	for (i = 1; i < n_picked; i++)
 	{
 		LocalPred key = picked[i];
@@ -578,19 +534,8 @@ qualset_trim_to_max(QualSet *qs)
 	for (i = 0; i < n_picked; i++)
 		qs->preds[i] = picked[i];
 	qs->n_preds = n_picked;
-	(void) eq_count;
 }
 
-/*
- * Process one SeqScan node: walk its qual list and record per-column
- * predicate hits AND multi-column co-occurrence in shared memory.
- *
- *   Step 1: walk the qual tree, accumulating distinct (attno, op) pairs
- *           into a local QualSet (no lock held).
- *   Step 2: under the lock, bump the singleton hit counter for every
- *           attr in the QualSet, AND if 2-3 distinct attrs were observed,
- *           bump the matching colset slot.
- */
 static void
 process_seqscan(SeqScanState *node)
 {
@@ -610,12 +555,11 @@ process_seqscan(SeqScanState *node)
 	if (!OidIsValid(relid))
 		return;
 
-	/* Uncompiled qual list lives on the static Plan node */
 	qual = node->ss.ps.plan->qual;
 	if (qual == NIL)
 		return;
 
-	/* Step 1: accumulate predicates without holding the lock. */
+	/* Walk the qual tree without holding the lock. */
 	qs.n_preds = 0;
 	foreach(lc, qual)
 		process_qual_node(&qs, (Expr *) lfirst(lc));
@@ -626,12 +570,10 @@ process_seqscan(SeqScanState *node)
 	qualset_sort_by_attno(&qs);
 	qualset_trim_to_max(&qs);
 
-	/* Step 2: apply to shared memory. */
 	LWLockAcquire(auto_index_state->lock, LW_EXCLUSIVE);
 
 	tslot = find_table_slot(relid);
 
-	/* Bump singletons. */
 	for (i = 0; i < qs.n_preds; i++)
 	{
 		int		cslot = find_col_slot(tslot, qs.preds[i].attno);
@@ -643,8 +585,6 @@ process_seqscan(SeqScanState *node)
 			auto_index_state->tables[tslot].columns[cslot].range_hits++;
 	}
 
-	/* Bump colset if 2+ distinct attrs.  attnos sorted ascending; ops
-	 * aligned with attnos. */
 	if (qs.n_preds >= 2 && qs.n_preds <= AUTO_INDEX_COLSET_MAX_COLS)
 	{
 		AttrNumber	attnos[AUTO_INDEX_COLSET_MAX_COLS];
@@ -664,10 +604,6 @@ process_seqscan(SeqScanState *node)
 	LWLockRelease(auto_index_state->lock);
 }
 
-/*
- * Recursively walk a PlanState tree, calling process_seqscan on every
- * SeqScanState node found.
- */
 static void
 walk_plan_state(PlanState *node)
 {
@@ -682,7 +618,7 @@ walk_plan_state(PlanState *node)
 	walk_plan_state(node->lefttree);
 	walk_plan_state(node->righttree);
 
-	/* Correlated subqueries live in subPlan, not left/right trees */
+	/* Correlated subqueries live in subPlan, not in the left/right trees. */
 	foreach(lc, node->subPlan)
 		walk_plan_state(((SubPlanState *) lfirst(lc))->planstate);
 }
@@ -690,7 +626,6 @@ walk_plan_state(PlanState *node)
 static void
 auto_index_executor_end(QueryDesc *queryDesc)
 {
-	/* Write tracking */
 	if (auto_index_state != NULL &&
 		(queryDesc->operation == CMD_INSERT ||
 		 queryDesc->operation == CMD_UPDATE ||
@@ -723,7 +658,6 @@ auto_index_executor_end(QueryDesc *queryDesc)
 		}
 	}
 
-	/* Read tracking */
 	if (auto_index_state != NULL && queryDesc->planstate != NULL)
 		walk_plan_state(queryDesc->planstate);
 
@@ -734,146 +668,131 @@ auto_index_executor_end(QueryDesc *queryDesc)
 }
 
 
-/* -------------------------------------------------------------------------
- * SQL-callable functions
- * -------------------------------------------------------------------------
- */
-
-PG_FUNCTION_INFO_V1(auto_index_reset);
-Datum
-auto_index_reset(PG_FUNCTION_ARGS)
-{
-	if (auto_index_state == NULL)
-		ereport(ERROR,
-				(errmsg("auto_index shared memory not initialised — "
-						"is auto_index in shared_preload_libraries?")));
-
-	LWLockAcquire(auto_index_state->lock, LW_EXCLUSIVE);
-	memset(auto_index_state->tables, 0,
-		   sizeof(auto_index_state->tables));
-	auto_index_state->access_counter = 0;
-	auto_index_state->generation++;
-	LWLockRelease(auto_index_state->lock);
-
-	PG_RETURN_VOID();
-}
-
-/*
- * auto_index_stats() — SRF returning one row per tracked (table, column) pair.
+/* ============================================================================
+ * 4. STRATEGIES
  *
- * We snapshot shared memory on the first call, store it in FuncCallContext,
- * then iterate across all table×column combinations across subsequent calls.
- */
+ * Pluggable predicates dispatched on auto_index.create_strategy.  Each
+ * decide_create_* takes the same CreateContext, returns true if the
+ * column (or, when invoked from the colset path, the synthetic column
+ * holding the colset's cumulative_benefit) qualifies for a new index.
+ * ============================================================================ */
 
-typedef struct StatsScanState
+typedef struct CreateContext
 {
-	/* local snapshot taken under the lock */
-	AutoIndexTableStats tables[AUTO_INDEX_MAX_TABLES];
-	/* current position */
-	int		tslot;
-	int		cslot;
-} StatsScanState;
+	const AutoIndexColumnStats *col;
+	const AutoIndexTableStats  *tbl;
+	int64	create_threshold;	/* ski-rental "buy after N queries" */
+	double	seq_scan_cost;
+	double	build_cost;
+	double	maint_per_write;
+	double	reltuples;
+	double	relpages;
+} CreateContext;
 
-PG_FUNCTION_INFO_V1(auto_index_stats);
-Datum
-auto_index_stats(PG_FUNCTION_ARGS)
+/* A: ski rental — cost-based, two checks (cumulative cost + read/write ratio). */
+static bool
+decide_create_ski_rental(const CreateContext *cc)
 {
-	FuncCallContext *funcctx;
-	StatsScanState  *scan;
+	double	cum_ratio;
 
-	if (SRF_IS_FIRSTCALL())
+	if (cc->col->cumulative_benefit < cc->create_threshold)
+		return false;
+
+	cum_ratio = (double) cc->col->cumulative_benefit
+				/ Max(1, cc->tbl->cumulative_write_cost);
+	return cum_ratio > auto_index_threshold;
+}
+
+/* B: simple_threshold — fire on raw cumulative_benefit, no cost model. */
+static bool
+decide_create_simple_threshold(const CreateContext *cc)
+{
+	return cc->col->cumulative_benefit >= (int64) auto_index_simple_threshold;
+}
+
+/* C: ratio_only — read/write ratio above auto_index.threshold. */
+static bool
+decide_create_ratio_only(const CreateContext *cc)
+{
+	double	ratio;
+
+	if (cc->col->cumulative_benefit == 0)
+		return false;
+
+	ratio = (double) cc->col->cumulative_benefit
+			/ Max(1, cc->tbl->cumulative_write_cost);
+	return ratio > auto_index_threshold;
+}
+
+/* D: cost_gain — projected savings minus maintenance must pay off build_cost. */
+static bool
+decide_create_cost_gain(const CreateContext *cc)
+{
+	double	idx_lookup_cost;
+	double	savings_per_query;
+	double	total_savings;
+	double	total_maint;
+
+	if (cc->col->cumulative_benefit == 0)
+		return false;
+
+	/* B-tree descent + one heap fetch. */
+	idx_lookup_cost = log2(Max(2.0, cc->reltuples)) * 2.0 * cpu_operator_cost
+					  + random_page_cost;
+	savings_per_query = cc->seq_scan_cost - idx_lookup_cost;
+	if (savings_per_query <= 0)
+		return false;
+
+	total_savings = (double) cc->col->cumulative_benefit * savings_per_query;
+	total_maint   = (double) cc->tbl->cumulative_write_cost * cc->maint_per_write;
+
+	return (total_savings - total_maint) >= cc->build_cost;
+}
+
+/* E: size_gated — simple_threshold gated by a minimum table size. */
+static bool
+decide_create_size_gated(const CreateContext *cc)
+{
+	if (cc->reltuples < auto_index_min_table_rows)
+		return false;
+	return cc->col->cumulative_benefit >= (int64) auto_index_simple_threshold;
+}
+
+/* F: always — fire on any positive benefit (still subject to post-checks). */
+static bool
+decide_create_always(const CreateContext *cc)
+{
+	return cc->col->cumulative_benefit > 0;
+}
+
+static bool
+decide_create(const CreateContext *cc)
+{
+	switch (auto_index_create_strategy)
 	{
-		MemoryContext oldctx;
-
-		funcctx = SRF_FIRSTCALL_INIT();
-		oldctx  = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-
-		if (auto_index_state == NULL)
-			ereport(ERROR,
-					(errmsg("auto_index shared memory not initialised — "
-							"is auto_index in shared_preload_libraries?")));
-
-		scan = palloc(sizeof(StatsScanState));
-		LWLockAcquire(auto_index_state->lock, LW_SHARED);
-		memcpy(scan->tables, auto_index_state->tables,
-			   sizeof(scan->tables));
-		LWLockRelease(auto_index_state->lock);
-		scan->tslot = 0;
-		scan->cslot = 0;
-
-		funcctx->user_fctx = scan;
-
-		/* Derive tuple descriptor from the function's declared OUT parameters */
-		{
-			TupleDesc tupdesc;
-
-			if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-				ereport(ERROR,
-						(errmsg("auto_index_stats: return type must be composite")));
-			funcctx->tuple_desc = BlessTupleDesc(tupdesc);
-		}
-
-		MemoryContextSwitchTo(oldctx);
+		case AI_CREATE_SIMPLE_THRESHOLD: return decide_create_simple_threshold(cc);
+		case AI_CREATE_RATIO_ONLY:		 return decide_create_ratio_only(cc);
+		case AI_CREATE_COST_GAIN:		 return decide_create_cost_gain(cc);
+		case AI_CREATE_SIZE_GATED:		 return decide_create_size_gated(cc);
+		case AI_CREATE_ALWAYS:			 return decide_create_always(cc);
+		case AI_CREATE_SKI_RENTAL:
+		default:						 return decide_create_ski_rental(cc);
 	}
-
-	funcctx = SRF_PERCALL_SETUP();
-	scan    = (StatsScanState *) funcctx->user_fctx;
-
-	/* Advance to the next non-empty column slot */
-	while (scan->tslot < AUTO_INDEX_MAX_TABLES)
-	{
-		AutoIndexTableStats  *t = &scan->tables[scan->tslot];
-		AutoIndexColumnStats *c;
-
-		if (!OidIsValid(t->relation_id))
-		{
-			scan->tslot++;
-			scan->cslot = 0;
-			continue;
-		}
-
-		if (scan->cslot >= AUTO_INDEX_MAX_COLS)
-		{
-			scan->tslot++;
-			scan->cslot = 0;
-			continue;
-		}
-
-		c = &t->columns[scan->cslot];
-		scan->cslot++;
-
-		if (!AttrNumberIsForUserDefinedAttr(c->attribute_number))
-			continue;
-		if (c->equality_hits == 0 && c->range_hits == 0)
-			continue;
-
-		{
-			Datum		values[4];
-			bool		nulls[4] = {false, false, false, false};
-			HeapTuple	tuple;
-
-			values[0] = ObjectIdGetDatum(t->relation_id);
-			values[1] = Int16GetDatum(c->attribute_number);
-			values[2] = Int64GetDatum(c->equality_hits);
-			values[3] = Int64GetDatum(c->range_hits);
-
-			tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
-			SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
-		}
-	}
-
-	SRF_RETURN_DONE(funcctx);
 }
 
 
-/* -------------------------------------------------------------------------
- * Background worker
- * -------------------------------------------------------------------------
- */
+/* ============================================================================
+ * 5. INDEX MANAGEMENT
+ *
+ * Background worker auto_index_main wakes every check_interval, folds
+ * interval counters into cumulative state, snapshots the tables array,
+ * and hands the snapshot to evaluate_and_manage_indexes — which in
+ * Phase 1 picks composite + singleton CREATE candidates (with
+ * subsumption: a composite's leading column suppresses its singleton)
+ * and runs the ski-rental DROP accumulator, then in Phase 2 emits one
+ * CREATE/DROP INDEX per decision.
+ * ============================================================================ */
 
-/*
- * Decision records built in Phase 1 (SELECT), consumed in Phase 2 (DDL).
- */
 #define MAX_DECISIONS 64
 
 typedef struct CreateDecision
@@ -894,11 +813,8 @@ typedef struct DropDecision
 	char	idxname[NAMEDATALEN];
 } DropDecision;
 
-/*
- * Query helpers — all must be called inside an active SPI connection.
- */
+/* Helpers below must run inside an active SPI connection. */
 
-/* Returns true if an index already covers attno on relid. */
 static bool
 index_exists_for_column(Oid relid, AttrNumber attno)
 {
@@ -916,7 +832,6 @@ index_exists_for_column(Oid relid, AttrNumber attno)
 	return (ret == SPI_OK_SELECT && SPI_processed > 0);
 }
 
-/* Returns the number of auto-created indexes already on relid. */
 static int
 count_auto_indexes(Oid relid)
 {
@@ -926,7 +841,7 @@ count_auto_indexes(Oid relid)
 	int		ret;
 	bool	isnull;
 
-	/* Skip if catalog table doesn't exist yet */
+	/* Catalog table may not exist yet (CREATE EXTENSION not yet run). */
 	ret = SPI_execute(
 		"SELECT 1 FROM pg_tables "
 		"WHERE schemaname = 'public' AND tablename = 'auto_index_catalog' LIMIT 1",
@@ -937,7 +852,6 @@ count_auto_indexes(Oid relid)
 	ret = SPI_execute_with_args(
 		"SELECT count(*)::int FROM auto_index_catalog WHERE relid = $1",
 		1, argtypes, args, nulls, true, 1);
-
 	if (ret != SPI_OK_SELECT || SPI_processed == 0)
 		return 0;
 
@@ -945,178 +859,10 @@ count_auto_indexes(Oid relid)
 									   SPI_tuptable->tupdesc, 1, &isnull));
 }
 
-/* -------------------------------------------------------------------------
- * Create-decision strategies
- *
- * Each decide_create_* function is a pure predicate over (column, table,
- * cost) state.  Returns true if the column qualifies for index creation
- * subject to the later checks (no existing index, max indexes, naming).
- *
- * The dispatcher decide_create() routes on auto_index.create_strategy.
- * The default branch is ski_rental, which mirrors the inline logic in
- * evaluate_and_manage_indexes — kept for parity with the existing code
- * path but only invoked when the dispatcher is called explicitly.
- * -------------------------------------------------------------------------
- */
-
-typedef struct CreateContext
-{
-	const AutoIndexColumnStats *col;
-	const AutoIndexTableStats  *tbl;
-	int64	create_threshold;	/* ski-rental "buy after N queries" */
-	double	seq_scan_cost;
-	double	build_cost;
-	double	maint_per_write;
-	double	reltuples;
-	double	relpages;
-} CreateContext;
-
 /*
- * Strategy A — ski rental (matches the inline checks in
- * evaluate_and_manage_indexes).  Provided as a function so callers can
- * dispatch uniformly.
- */
-static bool
-decide_create_ski_rental(const CreateContext *cc)
-{
-	double	cum_ratio;
-
-	if (cc->col->cumulative_benefit < cc->create_threshold)
-		return false;
-
-	cum_ratio = (double) cc->col->cumulative_benefit
-				/ Max(1, cc->tbl->cumulative_write_cost);
-	if (cum_ratio <= auto_index_threshold)
-		return false;
-
-	return true;
-}
-
-/*
- * Strategy B — simple threshold.  Fires when the cumulative weighted
- * benefit exceeds auto_index.simple_threshold.  No cost model, no
- * write-ratio guard.  Useful for benchmarks where you want a predictable
- * trigger.
- */
-static bool
-decide_create_simple_threshold(const CreateContext *cc)
-{
-	return cc->col->cumulative_benefit >= (int64) auto_index_simple_threshold;
-}
-
-/*
- * Strategy C — ratio only.  Read/write ratio above auto_index.threshold,
- * provided there is at least one read.  Ignores absolute volume, so it
- * fires on read-mostly tables even if traffic is light.
- */
-static bool
-decide_create_ratio_only(const CreateContext *cc)
-{
-	double	ratio;
-
-	if (cc->col->cumulative_benefit == 0)
-		return false;
-
-	ratio = (double) cc->col->cumulative_benefit
-			/ Max(1, cc->tbl->cumulative_write_cost);
-	return ratio > auto_index_threshold;
-}
-
-/*
- * Strategy D — cost-gain projection.
- *
- *   savings_per_query ≈ seq_scan_cost − idx_lookup_cost
- *   total_savings     = cumulative_benefit × savings_per_query
- *   total_maint       = cumulative_write_cost × maint_per_write
- *
- * Create when (total_savings − total_maint) >= build_cost: i.e. the
- * projected net benefit pays off the index build.  More aggressive than
- * ski rental on high seq/idx cost gaps; more conservative on tables with
- * heavy write traffic.
- */
-static bool
-decide_create_cost_gain(const CreateContext *cc)
-{
-	double	idx_lookup_cost;
-	double	savings_per_query;
-	double	total_savings;
-	double	total_maint;
-
-	if (cc->col->cumulative_benefit == 0)
-		return false;
-
-	/* Approximate index-scan cost: B-tree descent + one heap fetch. */
-	idx_lookup_cost = log2(Max(2.0, cc->reltuples)) * 2.0 * cpu_operator_cost
-					  + random_page_cost;
-	savings_per_query = cc->seq_scan_cost - idx_lookup_cost;
-
-	if (savings_per_query <= 0)
-		return false;
-
-	total_savings = (double) cc->col->cumulative_benefit * savings_per_query;
-	total_maint   = (double) cc->tbl->cumulative_write_cost * cc->maint_per_write;
-
-	return (total_savings - total_maint) >= cc->build_cost;
-}
-
-/*
- * Strategy E — size gated.  Like simple_threshold but only fires once
- * the table is at least auto_index.min_table_rows rows.  Avoids creating
- * indexes on tiny lookup tables where seq scan is already optimal.
- */
-static bool
-decide_create_size_gated(const CreateContext *cc)
-{
-	if (cc->reltuples < auto_index_min_table_rows)
-		return false;
-	return cc->col->cumulative_benefit >= (int64) auto_index_simple_threshold;
-}
-
-/*
- * Strategy F — always.  Fire on any positive cumulative benefit.  Useful
- * as the "maximum aggressiveness" upper bound: shows what happens when
- * we index every column auto_index has ever seen.  Subject to the
- * post-checks (no existing index, max_indexes_per_table) — those still
- * limit total fan-out.
- */
-static bool
-decide_create_always(const CreateContext *cc)
-{
-	return cc->col->cumulative_benefit > 0;
-}
-
-/*
- * Dispatcher — routes on the auto_index.create_strategy GUC.
- */
-static bool
-decide_create(const CreateContext *cc)
-{
-	switch (auto_index_create_strategy)
-	{
-		case AI_CREATE_SIMPLE_THRESHOLD:
-			return decide_create_simple_threshold(cc);
-		case AI_CREATE_RATIO_ONLY:
-			return decide_create_ratio_only(cc);
-		case AI_CREATE_COST_GAIN:
-			return decide_create_cost_gain(cc);
-		case AI_CREATE_SIZE_GATED:
-			return decide_create_size_gated(cc);
-		case AI_CREATE_ALWAYS:
-			return decide_create_always(cc);
-		case AI_CREATE_SKI_RENTAL:
-		default:
-			return decide_create_ski_rental(cc);
-	}
-}
-
-/*
- * Reorder a colset for the actual CREATE INDEX:
- *   1. Equality columns first (most restrictive predicates lead — also
- *      the only way the planner can use later columns of a B-tree).
- *   2. Range columns next.
- *   3. Within each group, ascending by attno (deterministic naming).
- *
- * out_attnos / out_ops must each have room for cs->n_cols entries.
+ * Reorder colset for actual CREATE INDEX: equality columns first (only
+ * way the planner can use later columns of a B-tree), range last,
+ * attno ascending within each group.  out arrays must hold cs->n_cols.
  */
 static void
 reorder_colset_for_index(const AutoIndexColSet *cs,
@@ -1124,7 +870,6 @@ reorder_colset_for_index(const AutoIndexColSet *cs,
 {
 	int		i, k = 0;
 
-	/* Equality first */
 	for (i = 0; i < cs->n_cols; i++)
 		if (cs->ops[i] == 0)
 		{
@@ -1132,7 +877,6 @@ reorder_colset_for_index(const AutoIndexColSet *cs,
 			out_ops[k] = 0;
 			k++;
 		}
-	/* Range last */
 	for (i = 0; i < cs->n_cols; i++)
 		if (cs->ops[i] == 1)
 		{
@@ -1143,10 +887,9 @@ reorder_colset_for_index(const AutoIndexColSet *cs,
 }
 
 /*
- * Subsumption check.  Returns true if (relid, attno) is the LEADING
- * column of a composite already queued in to_create[].  When the
- * composite exists the planner can serve `WHERE col = ?` queries via
- * leftmost-prefix, so a separate singleton on that column is redundant.
+ * Subsumption: when a composite is queued, a singleton on its LEADING
+ * column is redundant (B-tree leftmost prefix serves "WHERE col = ?").
+ * Singletons on non-leading composite columns are NOT covered.
  */
 static bool
 is_attno_covered_by_pending_composite(const CreateDecision *to_create,
@@ -1165,13 +908,17 @@ is_attno_covered_by_pending_composite(const CreateDecision *to_create,
 }
 
 /*
- * Core evaluation loop.  snapshot is a local copy of the shared memory
- * tables array taken before any SPI work.
+ * Ski rental cost model (PostgreSQL planner units):
+ *   create_threshold = ceil(build_cost / seq_scan_cost)
+ *   drop_threshold   = build_cost * 1000
+ *   idle_accumulator += (writes * maint_per_write + seq_scan_cost) * 1000
+ * Scaling by 1000 keeps precision in the bigint catalog column.  The
+ * seq_scan_cost floor ensures even zero-write tables age out an unused
+ * index after roughly create_threshold idle intervals.
  *
- * Phase 1: run SELECTs inside a normal transaction to gather decisions.
- *          Composites are evaluated FIRST so their leading columns can
- *          subsume singleton candidates in the second loop.
- * Phase 2: execute DDL in a non-atomic SPI context.
+ * Phase 1: gather decisions inside one regular transaction.
+ * Phase 2: one transaction per CREATE/DROP — CONCURRENTLY can't run in
+ *          any SPI context in a bgworker, so plain CREATE/DROP is used.
  */
 static void
 evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
@@ -1183,10 +930,7 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 	int				i,
 					c;
 
-	/* ------------------------------------------------------------------
-	 * Phase 1: gather decisions inside a regular transaction
-	 * ------------------------------------------------------------------
-	 */
+	/* ---------- Phase 1: gather decisions ---------- */
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	SPI_connect();
@@ -1197,48 +941,25 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 		AutoIndexTableStats *t = &snapshot[i];
 		int		ret;
 
-		/* Per-table metadata resolved once and reused for both CREATE and DROP */
 		char   *schema = NULL;
 		char   *relname = NULL;
 		double	reltuples,
 				relpages;
 
-		/*
-		 * Ski rental cost model (PostgreSQL planner units):
-		 *
-		 *   seq_scan_cost  = cost of one full table scan
-		 *   build_cost     = cost of building a B-tree index
-		 *                    (heap read + sort comparisons)
-		 *   maint_per_write = cost to maintain the index for one write
-		 *                    (log2(N) comparisons + random page write)
-		 *
-		 * create_threshold  = queries needed before "buying" the index
-		 *                   = ceil(build_cost / seq_scan_cost)
-		 *
-		 * drop_threshold    = build_cost * 1000  (scaled to fit int64)
-		 * idle accumulator  = sum over idle intervals of:
-		 *                     (writes * maint_per_write + seq_scan_cost) * 1000
-		 *   The seq_scan_cost term is an opportunity-cost floor that ensures
-		 *   even zero-write tables eventually drop an unused index after
-		 *   create_threshold idle intervals.
-		 */
 		int64	create_threshold;
 		int64	drop_threshold;
 		double	seq_scan_cost_val;
 		double	build_cost_val;
 		double	maint_per_write;
 
-		/* interval write count still available in snapshot before zeroing */
+		/* Read interval write count from the snapshot before it's stale. */
 		int64	interval_write_cost =
 			t->insert_count + t->update_count + t->delete_count;
 
 		if (!OidIsValid(t->relation_id))
 			continue;
 
-		/* ------------------------------------------------------------------
-		 * Resolve table metadata and compute cost-based thresholds once.
-		 * ------------------------------------------------------------------
-		 */
+		/* Resolve table metadata. */
 		{
 			Oid		meta_argtypes[1] = {OIDOID};
 			Datum	meta_args[1]	 = {ObjectIdGetDatum(t->relation_id)};
@@ -1267,21 +988,10 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 		}
 
 		/*
-		 * Compute cost-based ski rental thresholds using PostgreSQL's own
-		 * cost functions rather than hand-rolled formulas.
-		 *
-		 * cost_seqscan() gives the planner's actual estimate for one full
-		 * table scan, respecting tablespace cost settings and all CPU costs.
-		 *
-		 * cost_sort() gives the planner's estimate for sorting reltuples
-		 * rows, which dominates B-tree index build cost (the executor sorts
-		 * the heap before writing the index in page order).  We use
-		 * maintenance_work_mem because that is what CREATE INDEX actually
-		 * uses for its sort buffers.
-		 *
-		 * maint_per_write uses cpu_index_tuple_cost (the planner's cost
-		 * per index tuple insertion) plus a random I/O charge — identical
-		 * to how the planner models ongoing B-tree maintenance overhead.
+		 * Use PostgreSQL's own cost_seqscan / cost_sort so we respect
+		 * tablespace and CPU cost GUCs.  cost_sort dominates B-tree
+		 * build cost (the executor sorts the heap then writes pages
+		 * in order) and uses maintenance_work_mem for sort buffers.
 		 */
 		{
 			RelOptInfo	rel_info;
@@ -1294,41 +1004,26 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 			memset(&seq_path,  0, sizeof(seq_path));
 			memset(&sort_path, 0, sizeof(sort_path));
 
-			/* Minimal fields required by cost_seqscan assertions */
-			rel_info.relid		  = 1;		/* > 0 to satisfy Assert */
-			rel_info.rtekind	  = RTE_RELATION;
-			rel_info.reltablespace = 0;		/* default tablespace */
-			rel_info.pages		  = (BlockNumber) relpages;
-			rel_info.tuples		  = reltuples;
-			rel_info.rows		  = reltuples;
-
-			/* cost_seqscan reads path->pathtarget->cost — must be non-NULL */
-			seq_path.pathtarget = &tgt;
+			rel_info.relid		   = 1;		/* > 0 to satisfy Assert */
+			rel_info.rtekind	   = RTE_RELATION;
+			rel_info.reltablespace = 0;
+			rel_info.pages		   = (BlockNumber) relpages;
+			rel_info.tuples		   = reltuples;
+			rel_info.rows		   = reltuples;
+			seq_path.pathtarget	   = &tgt;	/* cost_seqscan dereferences this */
 
 			cost_seqscan(&seq_path, NULL, &rel_info, NULL);
 			seq_scan_cost_val = seq_path.total_cost;
 
-			/*
-			 * Index build cost ≈ sort cost with seq scan as input.
-			 * input_disabled_nodes=0: we are not in a disabled plan context.
-			 */
 			cost_sort(&sort_path, NULL,
-					  NIL,					/* pathkeys — unused by cost_sort */
-					  0,					/* input_disabled_nodes */
-					  seq_scan_cost_val,	/* cost to read the heap */
-					  reltuples,
-					  8,					/* avg index entry width (bytes) */
-					  2.0 * cpu_operator_cost,	/* comparison cost */
+					  NIL, 0,
+					  seq_scan_cost_val, reltuples,
+					  8,					/* avg index entry width */
+					  2.0 * cpu_operator_cost,
 					  maintenance_work_mem,
-					  -1.0);				/* no row limit */
+					  -1.0);
 			build_cost_val = sort_path.total_cost;
 
-			/*
-			 * Per-write index maintenance cost: one index tuple insertion
-			 * (cpu_index_tuple_cost) plus one random page write (amortised
-			 * to random_page_cost).  This matches how the planner models
-			 * write amplification for maintained B-tree indexes.
-			 */
 			maint_per_write = cpu_index_tuple_cost + random_page_cost;
 		}
 
@@ -1336,19 +1031,11 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 								Max(seq_scan_cost_val, 1.0)));
 		drop_threshold   = (int64) (build_cost_val * 1000.0);
 
-		/*
-		 * CREATE candidates — composites FIRST, then singletons.
-		 *
-		 * A composite (a, b, c) is strictly superior to a singleton on the
-		 * leading column `a` for any query that filters on `a` alone (B-tree
-		 * leftmost prefix), so we want composites to win when both qualify.
-		 * Singletons on non-leading columns of the composite are NOT
-		 * suppressed — those queries can't use the composite.
-		 */
+		/* ----- CREATE: composites first, then singletons ----- */
 		{
 			int		cs_idx;
 
-			/* === Composite candidates === */
+			/* Composite candidates. */
 			for (cs_idx = 0;
 				 cs_idx < AUTO_INDEX_MAX_COLSETS && n_create < MAX_DECISIONS;
 				 cs_idx++)
@@ -1359,18 +1046,15 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 				bool				skip = false;
 				int					ci;
 				CreateDecision	   *d;
-				char				attno_list[64];
 
 				if (cs->n_cols < 2)
 					continue;
 
-				/* Strategy gate.  ski_rental keeps its original two-check
-				 * cost+ratio test inline; other strategies use a synthetic
-				 * column-stats so the existing decide_create() works. */
+				/* ski_rental keeps its inline two-check form for parity;
+				 * other strategies wrap a synthetic ColumnStats. */
 				if (auto_index_create_strategy == AI_CREATE_SKI_RENTAL)
 				{
 					double	cum_ratio;
-
 					if (cs->cumulative_benefit < create_threshold)
 						continue;
 					cum_ratio = (double) cs->cumulative_benefit
@@ -1402,11 +1086,9 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 
 				if (count_auto_indexes(t->relation_id) >=
 					auto_index_max_indexes_per_table)
-					break;					/* per-table cap reached */
+					break;
 
-				/* Reorder for B-tree leading-column priority. */
 				reorder_colset_for_index(cs, ord_attnos, ord_ops);
-				(void) attno_list;
 
 				d = &to_create[n_create];
 				d->relid	= t->relation_id;
@@ -1416,8 +1098,7 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 				strlcpy(d->schema,	schema,		NAMEDATALEN);
 				strlcpy(d->relname, relname,	NAMEDATALEN);
 
-				/* Resolve column names individually.  If any lookup fails
-				 * we abandon the whole composite to avoid partial state. */
+				/* Resolve column names; abandon composite if any miss. */
 				for (ci = 0; ci < cs->n_cols; ci++)
 				{
 					Oid		argtypes[2] = {OIDOID, INT2OID};
@@ -1443,7 +1124,6 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 				if (skip)
 					continue;
 
-				/* Index name: auto_idx_m_<relid>_<attnos…> */
 				if (cs->n_cols == 2)
 					snprintf(d->idxname, NAMEDATALEN,
 							 "auto_idx_m_%u_%d_%d",
@@ -1456,7 +1136,7 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 				n_create++;
 			}
 
-			/* === Singleton candidates === */
+			/* Singleton candidates. */
 			for (c = 0; c < AUTO_INDEX_MAX_COLS && n_create < MAX_DECISIONS; c++)
 			{
 				AutoIndexColumnStats   *col = &t->columns[c];
@@ -1466,16 +1146,12 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 				if (!AttrNumberIsForUserDefinedAttr(col->attribute_number))
 					continue;
 
-				/* Subsumption: leading column of a composite we already
-				 * queued.  Don't create the singleton; the composite will
-				 * serve `WHERE col = ?` via leftmost prefix. */
+				/* Subsumption — composite covers this column's queries. */
 				if (is_attno_covered_by_pending_composite(
 						to_create, n_create,
 						t->relation_id, col->attribute_number))
 					continue;
 
-				/* Strategy dispatch.  ski_rental keeps original inline
-				 * behaviour; others go through decide_create(). */
 				if (auto_index_create_strategy == AI_CREATE_SKI_RENTAL)
 				{
 					if (col->cumulative_benefit < create_threshold)
@@ -1508,11 +1184,10 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 					auto_index_max_indexes_per_table)
 					continue;
 
-				/* Resolve column name */
 				{
 					Oid		col_argtypes[2] = {OIDOID, INT2OID};
 					Datum	col_args[2]		= {ObjectIdGetDatum(t->relation_id),
-										   Int16GetDatum(col->attribute_number)};
+											   Int16GetDatum(col->attribute_number)};
 					char	col_nulls[2]	= {' ', ' '};
 					char   *attname;
 					CreateDecision *d = &to_create[n_create];
@@ -1539,13 +1214,12 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 			}
 		}
 
-		/* DROP candidates: ski rental on idle maintenance cost */
+		/* ----- DROP candidates: ski-rental on idle maintenance cost ----- */
 		{
 			Oid		argtypes[1] = {OIDOID};
 			Datum	args[1]		= {ObjectIdGetDatum(t->relation_id)};
 			char	nulls[1]	= {' '};
 
-			/* catalog may not exist yet */
 			ret = SPI_execute(
 				"SELECT 1 FROM pg_tables "
 				"WHERE schemaname = 'public' AND tablename = 'auto_index_catalog' LIMIT 1",
@@ -1592,7 +1266,6 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 						"SELECT idx_scan FROM pg_stat_user_indexes "
 						"WHERE indexrelid = $1",
 						1, scan_argtypes, scan_args, scan_nulls, true, 1);
-
 					if (ret3 != SPI_OK_SELECT || SPI_processed == 0)
 						continue;
 
@@ -1602,11 +1275,8 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 
 					if (last_scan == -1)
 					{
-						/*
-						 * Sentinel: first evaluation after creation.  Just
-						 * record the baseline scan count; don't start the ski
-						 * rental idle accumulator yet.
-						 */
+						/* Sentinel: first eval after creation.  Just record the
+						 * baseline scan count; don't accumulate idle cost yet. */
 						Oid		upd_t[2]  = {INT8OID, OIDOID};
 						Datum	upd_a[2]  = {Int64GetDatum(cur_scan),
 											 ObjectIdGetDatum(indexrelid)};
@@ -1624,10 +1294,7 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 
 					if (cur_scan > last_scan)
 					{
-						/*
-						 * Index was actually used this interval: reset the
-						 * idle accumulator — the ski rental clock restarts.
-						 */
+						/* Index was used — reset the idle clock. */
 						Oid		upd_t[2]  = {INT8OID, OIDOID};
 						Datum	upd_a[2]  = {Int64GetDatum(cur_scan),
 											 ObjectIdGetDatum(indexrelid)};
@@ -1643,19 +1310,7 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 					}
 					else
 					{
-						/*
-						 * Ski rental drop: accumulate idle maintenance cost.
-						 *
-						 * Each idle interval contributes:
-						 *   writes * maint_per_write + seq_scan_cost
-						 *
-						 * The seq_scan_cost floor is the opportunity cost of
-						 * holding an unused index slot; it ensures zero-write
-						 * tables also age out after create_threshold intervals.
-						 *
-						 * All values are scaled by 1000 to keep precision in
-						 * the bigint catalog column.
-						 */
+						/* Idle interval — accumulate maintenance cost. */
 						double	contribution =
 							(interval_write_cost * maint_per_write
 							 + seq_scan_cost_val) * 1000.0;
@@ -1697,17 +1352,7 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 	SPI_finish();
 	CommitTransactionCommand();
 
-	/* ------------------------------------------------------------------
-	 * Phase 2: one transaction per DDL statement.
-	 *
-	 * CREATE/DROP INDEX CONCURRENTLY cannot run inside any SPI context
-	 * (atomic or non-atomic) in a bgworker because the CONCURRENTLY path
-	 * internally commits and restarts transactions, which confuses the SPI
-	 * snapshot stack.  Regular CREATE/DROP INDEX is used instead; it takes
-	 * a short ShareLock during the build which is acceptable for the tables
-	 * and workloads this extension targets.
-	 * ------------------------------------------------------------------
-	 */
+	/* ---------- Phase 2: emit DDL ---------- */
 	if (n_create == 0 && n_drop == 0)
 		return;
 
@@ -1719,20 +1364,18 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 		char	attnos_literal[64];
 		int		k;
 
-		/* Build "col1, col2, col3" for CREATE INDEX. */
+		/* "col1, col2, col3" for the CREATE INDEX column list. */
 		{
 			int written = 0;
 			for (k = 0; k < d->n_cols; k++)
-			{
 				written += snprintf(collist + written,
 									sizeof(collist) - written,
 									"%s%s",
 									(k == 0 ? "" : ", "),
 									d->attnames[k]);
-			}
 		}
 
-		/* Build "ARRAY[a, b, c]::smallint[]" for catalog INSERT. */
+		/* "ARRAY[a, b, c]::smallint[]" for the catalog INSERT. */
 		{
 			int written = snprintf(attnos_literal, sizeof(attnos_literal),
 								   "ARRAY[%d", d->attnos[0]);
@@ -1758,14 +1401,11 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 
 			SPI_execute(sql, false, 0);
 
-			/* Record in catalog using INSERT...SELECT to avoid a separate
-			 * OID lookup — the index is visible in pg_class within the same
-			 * transaction so this finds it and inserts in one statement.
-			 *
-			 * The attnos array is interpolated into the SQL text directly
-			 * (small ints from internal sources, no injection risk) because
-			 * SPI_execute_with_args has no convenient way to pass an array
-			 * literal as a single bind. */
+			/* INSERT...SELECT finds the OID of the index we just created
+			 * (visible in pg_class within the same transaction).  attnos
+			 * literal is interpolated into the SQL text — small ints from
+			 * internal source, no injection risk; SPI_execute_with_args
+			 * has no convenient way to bind an array literal. */
 			{
 				char	insert_sql[768];
 				Oid		argtypes[2] = {OIDOID, NAMEOID};
@@ -1784,9 +1424,8 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 					"ON CONFLICT DO NOTHING",
 					attnos_literal);
 
-				/* Use -1 as the initial baseline so the first DROP evaluation
-				 * sees cur_scan(0) != last_scan(-1) and skips the drop.
-				 * Only after one full interval with no usage will it drop. */
+				/* -1 baseline: first DROP eval sees cur_scan(0) != -1 and
+				 * skips drop, so a fresh index gets one full idle interval. */
 				SPI_execute_with_args(insert_sql,
 									  2, argtypes, args, nulls, false, 0);
 			}
@@ -1797,10 +1436,9 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 
 			/*
 			 * Reset cumulative_benefit so this column / colset doesn't
-			 * immediately re-qualify on the next pass.  For singletons we
-			 * reset the column slot; for composites we reset the matching
-			 * colset slot AND the leading column's singleton (since the
-			 * composite serves it via leftmost-prefix).
+			 * immediately re-qualify next pass.  For composites we reset
+			 * the matching colset slot (any-order match) AND the leading
+			 * column's singleton (composite serves it via leftmost prefix).
 			 */
 			{
 				int si, ci, csi, m;
@@ -1825,8 +1463,6 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 					}
 					else
 					{
-						/* Reset matching colset (any-order match on the set
-						 * of attnos). */
 						for (csi = 0; csi < AUTO_INDEX_MAX_COLSETS; csi++)
 						{
 							AutoIndexColSet *cs = &t->colsets[csi];
@@ -1851,7 +1487,6 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 							if (match)
 								cs->cumulative_benefit = 0;
 						}
-						/* Reset leading column singleton too. */
 						for (ci = 0; ci < AUTO_INDEX_MAX_COLS; ci++)
 							if (t->columns[ci].attribute_number == d->attnos[0])
 							{
@@ -1902,7 +1537,6 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 
 			SPI_execute(sql, false, 0);
 
-			/* Remove from catalog */
 			{
 				Oid		argtypes[1] = {OIDOID};
 				Datum	args[1]		= {ObjectIdGetDatum(d->indexrelid)};
@@ -1937,6 +1571,20 @@ evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
 	}
 }
 
+/*
+ * Background worker entry point.
+ *
+ * Each iteration:
+ *   1. Wait for check_interval seconds (or latch / postmaster death).
+ *   2. Acquire the lock and:
+ *        Phase A — fold interval counters into cumulative state.
+ *        Phase B — copy the tables array into a local snapshot.
+ *        Phase C — zero interval counters.
+ *      Order matters: snapshot must reflect THIS interval's hits (Phase A
+ *      before B), but evaluate also reads interval_write_cost so we
+ *      defer zeroing until after the snapshot (B before C).
+ *   3. Release lock and call evaluate_and_manage_indexes(snapshot).
+ */
 PGDLLEXPORT void
 auto_index_main(Datum main_arg)
 {
@@ -1961,20 +1609,6 @@ auto_index_main(Datum main_arg)
 
 		CHECK_FOR_INTERRUPTS();
 
-		/*
-		 * Fold interval counters into cumulative totals BEFORE taking the
-		 * snapshot, so this pass's evaluate sees the workload that just
-		 * happened.  cumulative_benefit and cumulative_write_cost persist
-		 * across intervals — they implement the ski rental "rent
-		 * accumulator" and are only reset by auto_index_reset() or when an
-		 * index is successfully created for a column.
-		 *
-		 * Interval counters (insert/update/delete_count, equality_hits,
-		 * range_hits) are left non-zero through the snapshot so the drop
-		 * logic in evaluate_and_manage_indexes can read interval_write_cost
-		 * for the current interval.  They are zeroed in shared memory
-		 * before releasing the lock.
-		 */
 		snapshot = palloc(sizeof(auto_index_state->tables));
 		{
 			int		si,
@@ -1982,24 +1616,23 @@ auto_index_main(Datum main_arg)
 
 			LWLockAcquire(auto_index_state->lock, LW_EXCLUSIVE);
 
-			/* Phase A: fold interval -> cumulative */
+			/* Phase A: fold interval -> cumulative. */
 			for (si = 0; si < AUTO_INDEX_MAX_TABLES; si++)
 			{
 				AutoIndexTableStats *t = &auto_index_state->tables[si];
 				int		csi;
 
-				t->cumulative_write_cost += t->insert_count + t->update_count + t->delete_count;
+				t->cumulative_write_cost +=
+					t->insert_count + t->update_count + t->delete_count;
 				for (ci = 0; ci < AUTO_INDEX_MAX_COLS; ci++)
-				{
 					t->columns[ci].cumulative_benefit +=
 						t->columns[ci].equality_hits * 2 + t->columns[ci].range_hits;
-				}
 				for (csi = 0; csi < AUTO_INDEX_MAX_COLSETS; csi++)
 				{
-					/* Composite benefit weight: each hit reflects ALL the
-					 * columns that came together, so it's worth more than
-					 * a single-column hit.  Use n_cols × hits to bias
-					 * toward composites the planner can actually exploit. */
+					/* Composite weight = n_cols × hits — biases the
+					 * decision toward composites that the planner can
+					 * actually exploit (each hit reflects N columns
+					 * appearing together). */
 					AutoIndexColSet *cs = &t->colsets[csi];
 					if (cs->n_cols == 0)
 						continue;
@@ -2007,10 +1640,10 @@ auto_index_main(Datum main_arg)
 				}
 			}
 
-			/* Phase B: snapshot — captures updated cumulative + original interval */
+			/* Phase B: snapshot. */
 			memcpy(snapshot, auto_index_state->tables, sizeof(auto_index_state->tables));
 
-			/* Phase C: zero the interval counters in shared memory */
+			/* Phase C: zero interval counters. */
 			for (si = 0; si < AUTO_INDEX_MAX_TABLES; si++)
 			{
 				AutoIndexTableStats *t = &auto_index_state->tables[si];
@@ -2037,7 +1670,6 @@ auto_index_main(Datum main_arg)
 		}
 		PG_CATCH();
 		{
-			/* Log error and continue — the worker should not crash */
 			elog(WARNING, "auto_index: evaluation pass failed: %m");
 			FlushErrorState();
 		}
@@ -2045,4 +1677,126 @@ auto_index_main(Datum main_arg)
 
 		pfree(snapshot);
 	}
+}
+
+
+/* ============================================================================
+ * 6. SQL-CALLABLE FUNCTIONS
+ * ============================================================================ */
+
+PG_FUNCTION_INFO_V1(auto_index_reset);
+Datum
+auto_index_reset(PG_FUNCTION_ARGS)
+{
+	if (auto_index_state == NULL)
+		ereport(ERROR,
+				(errmsg("auto_index shared memory not initialised — "
+						"is auto_index in shared_preload_libraries?")));
+
+	LWLockAcquire(auto_index_state->lock, LW_EXCLUSIVE);
+	memset(auto_index_state->tables, 0,
+		   sizeof(auto_index_state->tables));
+	auto_index_state->access_counter = 0;
+	auto_index_state->generation++;
+	LWLockRelease(auto_index_state->lock);
+
+	PG_RETURN_VOID();
+}
+
+/* SRF returning one row per tracked (table, column) pair with hits > 0. */
+
+typedef struct StatsScanState
+{
+	AutoIndexTableStats tables[AUTO_INDEX_MAX_TABLES];
+	int		tslot;
+	int		cslot;
+} StatsScanState;
+
+PG_FUNCTION_INFO_V1(auto_index_stats);
+Datum
+auto_index_stats(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	StatsScanState  *scan;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		MemoryContext oldctx;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldctx  = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		if (auto_index_state == NULL)
+			ereport(ERROR,
+					(errmsg("auto_index shared memory not initialised — "
+							"is auto_index in shared_preload_libraries?")));
+
+		scan = palloc(sizeof(StatsScanState));
+		LWLockAcquire(auto_index_state->lock, LW_SHARED);
+		memcpy(scan->tables, auto_index_state->tables,
+			   sizeof(scan->tables));
+		LWLockRelease(auto_index_state->lock);
+		scan->tslot = 0;
+		scan->cslot = 0;
+
+		funcctx->user_fctx = scan;
+
+		{
+			TupleDesc tupdesc;
+
+			if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+				ereport(ERROR,
+						(errmsg("auto_index_stats: return type must be composite")));
+			funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+		}
+
+		MemoryContextSwitchTo(oldctx);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	scan    = (StatsScanState *) funcctx->user_fctx;
+
+	while (scan->tslot < AUTO_INDEX_MAX_TABLES)
+	{
+		AutoIndexTableStats  *t = &scan->tables[scan->tslot];
+		AutoIndexColumnStats *c;
+
+		if (!OidIsValid(t->relation_id))
+		{
+			scan->tslot++;
+			scan->cslot = 0;
+			continue;
+		}
+
+		if (scan->cslot >= AUTO_INDEX_MAX_COLS)
+		{
+			scan->tslot++;
+			scan->cslot = 0;
+			continue;
+		}
+
+		c = &t->columns[scan->cslot];
+		scan->cslot++;
+
+		if (!AttrNumberIsForUserDefinedAttr(c->attribute_number))
+			continue;
+		if (c->equality_hits == 0 && c->range_hits == 0)
+			continue;
+
+		{
+			Datum		values[4];
+			bool		nulls[4] = {false, false, false, false};
+			HeapTuple	tuple;
+
+			values[0] = ObjectIdGetDatum(t->relation_id);
+			values[1] = Int16GetDatum(c->attribute_number);
+			values[2] = Int64GetDatum(c->equality_hits);
+			values[3] = Int64GetDatum(c->range_hits);
+
+			tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+			SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+		}
+	}
+
+	SRF_RETURN_DONE(funcctx);
 }

@@ -3,8 +3,7 @@
 # In-container TPC-H setup.  Idempotent — re-runnable; skips steps already
 # done (clone, build, generate, schema, load).
 #
-# Run inside the container:
-#   bash scripts/setup_tpch.sh
+# Called from scripts/benchmark.sh — not usually invoked directly.
 #
 # Env vars:
 #   SF=0.1          scale factor (0.01..10).  SF=1 ≈ 1 GB raw + ~2 GB in PG.
@@ -21,7 +20,7 @@ SF=${SF:-0.1}
 DBGEN_REPO=${DBGEN_REPO:-https://github.com/electrum/tpch-dbgen.git}
 FORCE_RELOAD=${FORCE_RELOAD:-0}
 
-TPCH_DIR=/postgres/tpch
+TPCH_DIR=/postgres/scripts/lib/tpch
 DBGEN_DIR=$TPCH_DIR/dbgen
 DATA_DIR=$TPCH_DIR/data-sf${SF}
 SCRIPTS_DIR=/postgres/scripts
@@ -116,4 +115,4 @@ $PSQL -c "ANALYZE;"
 echo "Done."
 
 banner "TPC-H setup complete (SF=$SF)"
-echo "Next: bash scripts/test_tpch.sh"
+echo "Next: scripts/benchmark.sh tpch"
