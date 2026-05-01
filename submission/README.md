@@ -6,17 +6,16 @@ creates / drops indexes (singleton or composite up to 3 columns).
 **Public git repository (forked from `postgres/postgres`):**
 <https://github.com/HypedUpbOii/postgres>
 
-The link is also in `git_url.txt`. The repo is a fork of upstream
-PostgreSQL: the merge-base ancestor commit is preserved, and all our
-work is on top.
+The link is also in `git_url.txt`.
 
 ## What's in this folder
 
 | Path | Contents |
 |---|---|
-| `report/submission_report.pdf` | This submission report (motivation, functionality, code, testing, AI usage). |
+| `report/submission_report.pdf` | The submission report (motivation, functionality, code, testing, AI usage with prompts). |
 | `report/report.pdf` | Full technical report (architecture deep-dive + per-strategy benchmark numbers). |
-| `diffs/` | Per-file diffs vs. the upstream PostgreSQL merge-base. The *only* upstream file we modified is `.gitignore` — every other change is a new file, listed under `new_files/` instead. |
+| `INVENTORY.md` | Table listing every file we modified or added, with the corresponding diff filename and (for new files) the mirror path. |
+| `diffs/` | One `.diff` file per file we touched.  Modified files are real `git diff`s; new files are `+`-only diffs against `/dev/null` (also produced by `git diff`).  Filenames are the original path with `/` replaced by `_`. |
 | `new_files/` | Every file we authored, mirrored at its original repository path so the layout matches the live repo. |
 | `test_data/` | TPC-H queries (Q1, Q3, Q5, Q6, Q10, Q12, Q14, Q19), TPC-H schema, TPC-C-lite schema + load + four transactions. The TPC-H raw `.tbl` data (~70 MB at SF=0.1) is *not* shipped — it is regenerated on demand by `scripts/lib/tpch_setup.sh` via `tpch-dbgen`. |
 
@@ -30,7 +29,7 @@ cd postgres
 scripts/quickstart.sh        # builds container, PG, extension, then runs a smoke pgbench demo
 ```
 
-From there, the four named benchmarks individually:
+Then the four named benchmarks individually:
 
 ```bash
 scripts/benchmark.sh pgbench    # ~52x live step in TPS

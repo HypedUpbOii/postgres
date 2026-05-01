@@ -1,0 +1,165 @@
+diff --git a/scripts/build_submission.sh b/scripts/build_submission.sh
+new file mode 100755
+index 0000000000..6b7b3cd896
+--- /dev/null
++++ b/scripts/build_submission.sh
+@@ -0,0 +1,159 @@
++#!/bin/bash
++#
++# Build the submission/ deliverable folder described in
++# report/submission_report.{md,pdf} (see Section 6).
++#
++# Layout produced:
++#
++#   submission/
++#     README.md                 — short orientation for the submission folder
++#     git_url.txt               — public fork URL
++#     diffs/                    — per-file diffs vs. the upstream merge-base
++#     new_files/                — every new file we authored, mirrored at
++#                                 its original path inside the repo
++#     test_data/                — TPC-H queries, TPC-H schema, TPC-C schema +
++#                                 transactions (small, ship-ready)
++#     report/
++#       submission_report.pdf
++#       report.pdf
++#
++# The script is idempotent: it wipes submission/ at the top and rebuilds.
++# Run from the repo root (or any subdirectory — paths are anchored to the
++# script).
++#
++set -e
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
++SUBMISSION="$REPO_ROOT/submission"
++
++# Last upstream commit before any of our work.  Anything reachable from
++# this commit is "upstream"; everything new is ours.
++UPSTREAM_BASE="3dd42ee97b"
++
++cd "$REPO_ROOT"
++
++echo "[*] Wiping old submission/ ..."
++rm -rf "$SUBMISSION"
++mkdir -p "$SUBMISSION/diffs" "$SUBMISSION/new_files" \
++         "$SUBMISSION/test_data" "$SUBMISSION/report"
++
++echo "[*] Writing git_url.txt ..."
++cat > "$SUBMISSION/git_url.txt" <<'EOF'
++https://github.com/HypedUpbOii/postgres
++EOF
++
++# ---------------------------------------------------------------------------
++# diffs/ — one .diff per modified-vs-upstream file.
++# We do not modify any upstream PostgreSQL source file; the only file that
++# diverges from upstream is .gitignore (we add ignores for our build dirs).
++# ---------------------------------------------------------------------------
++echo "[*] Generating diffs vs. upstream ($UPSTREAM_BASE) ..."
++mapfile -t MODIFIED_FILES < <(git diff --diff-filter=M --name-only "$UPSTREAM_BASE"..HEAD)
++for f in "${MODIFIED_FILES[@]}"; do
++    # Translate "/" to "_" for a flat diffs/ dir, keeping the original path
++    # readable in the filename.
++    out=$(echo "$f" | sed 's|/|_|g')
++    git diff "$UPSTREAM_BASE"..HEAD -- "$f" > "$SUBMISSION/diffs/${out}.diff"
++    echo "    diffs/${out}.diff"
++done
++
++# ---------------------------------------------------------------------------
++# new_files/ — every file added since the upstream base, mirrored at its
++# original repo path.
++# ---------------------------------------------------------------------------
++echo "[*] Mirroring new files ..."
++mapfile -t ADDED_FILES < <(git diff --diff-filter=A --name-only "$UPSTREAM_BASE"..HEAD)
++# Also include any *committed* file under contrib/auto_index/ that wasn't
++# present upstream — defensive in case of future renames.
++for f in "${ADDED_FILES[@]}"; do
++    [ -f "$f" ] || continue
++    dst="$SUBMISSION/new_files/$f"
++    mkdir -p "$(dirname "$dst")"
++    cp -p "$f" "$dst"
++done
++# Untracked but locally-authored files we want in the package
++# (submission_report.md/.tex/.pdf may be untracked at this point).
++for f in report/submission_report.md report/submission_report.tex; do
++    if [ -f "$REPO_ROOT/$f" ]; then
++        dst="$SUBMISSION/new_files/$f"
++        mkdir -p "$(dirname "$dst")"
++        cp -p "$REPO_ROOT/$f" "$dst"
++    fi
++done
++echo "    $(find "$SUBMISSION/new_files" -type f | wc -l) files mirrored"
++
++# ---------------------------------------------------------------------------
++# test_data/ — the actual benchmark workloads.  Small enough to ship
++# (TPC-H .tbl data is regenerated on demand by scripts/lib/tpch_setup.sh).
++# ---------------------------------------------------------------------------
++echo "[*] Copying test data ..."
++cp -r scripts/tpch_queries        "$SUBMISSION/test_data/tpch_queries"
++cp    scripts/tpch_schema.sql     "$SUBMISSION/test_data/"
++cp    scripts/tpcc_schema.sql     "$SUBMISSION/test_data/"
++cp    scripts/tpcc_load.sql       "$SUBMISSION/test_data/"
++cp -r scripts/tpcc_xn             "$SUBMISSION/test_data/tpcc_xn"
++echo "    $(find "$SUBMISSION/test_data" -type f | wc -l) test-data files copied"
++
++# ---------------------------------------------------------------------------
++# report/ — both PDFs.
++# ---------------------------------------------------------------------------
++echo "[*] Copying report PDFs ..."
++[ -f report/submission_report.pdf ] && cp report/submission_report.pdf "$SUBMISSION/report/"
++[ -f report/report.pdf ]            && cp report/report.pdf            "$SUBMISSION/report/"
++
++# ---------------------------------------------------------------------------
++# README.md — orientation for whoever opens the submission zip.
++# ---------------------------------------------------------------------------
++echo "[*] Writing submission/README.md ..."
++cat > "$SUBMISSION/README.md" <<'EOF'
++# auto_index — Project Submission
++
++PostgreSQL extension that observes live workload and automatically
++creates / drops indexes (singleton or composite up to 3 columns).
++
++**Public git repository (forked from `postgres/postgres`):**
++<https://github.com/HypedUpbOii/postgres>
++
++The link is also in `git_url.txt`. The repo is a fork of upstream
++PostgreSQL: the merge-base ancestor commit is preserved, and all our
++work is on top.
++
++## What's in this folder
++
++| Path | Contents |
++|---|---|
++| `report/submission_report.pdf` | This submission report (motivation, functionality, code, testing, AI usage). |
++| `report/report.pdf` | Full technical report (architecture deep-dive + per-strategy benchmark numbers). |
++| `diffs/` | Per-file diffs vs. the upstream PostgreSQL merge-base. The *only* upstream file we modified is `.gitignore` — every other change is a new file, listed under `new_files/` instead. |
++| `new_files/` | Every file we authored, mirrored at its original repository path so the layout matches the live repo. |
++| `test_data/` | TPC-H queries (Q1, Q3, Q5, Q6, Q10, Q12, Q14, Q19), TPC-H schema, TPC-C-lite schema + load + four transactions. The TPC-H raw `.tbl` data (~70 MB at SF=0.1) is *not* shipped — it is regenerated on demand by `scripts/lib/tpch_setup.sh` via `tpch-dbgen`. |
++
++## Reproducing the results
++
++The fastest path from a clean clone to all four headline benchmarks is:
++
++```bash
++git clone https://github.com/HypedUpbOii/postgres.git
++cd postgres
++scripts/quickstart.sh        # builds container, PG, extension, then runs a smoke pgbench demo
++```
++
++From there, the four named benchmarks individually:
++
++```bash
++scripts/benchmark.sh pgbench    # ~52x live step in TPS
++scripts/benchmark.sh tpch       # 8-query 3-phase TPC-H (auto-runs setup)
++scripts/benchmark.sh tpcc       # TPC-C-lite OLTP
++scripts/demo.sh                 # full create-then-drop lifecycle (~90 s)
++```
++
++See `QUICKSTART.md` in the repository root for a detailed
++from-scratch walkthrough.
++EOF
++
++echo ""
++echo "Submission built at: $SUBMISSION"
++echo ""
++du -sh "$SUBMISSION"
++find "$SUBMISSION" -maxdepth 2 -mindepth 1 | sort

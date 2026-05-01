@@ -1,0 +1,25 @@
+diff --git a/scripts/tpch_queries/q12.sql b/scripts/tpch_queries/q12.sql
+new file mode 100644
+index 0000000000..19f9055f3e
+--- /dev/null
++++ b/scripts/tpch_queries/q12.sql
+@@ -0,0 +1,19 @@
++-- TPC-H Q12: Shipping Modes and Order Priority
++-- 2-way join; lineitem has multiple correlated date filters.
++-- Predicate columns: l_shipmode (IN — NOT tracked by current process_seqscan!),
++-- l_commitdate, l_receiptdate, l_shipdate (range), o_orderkey/l_orderkey join.
++SELECT
++    l_shipmode,
++    sum(CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH'
++             THEN 1 ELSE 0 END) AS high_line_count,
++    sum(CASE WHEN o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH'
++             THEN 1 ELSE 0 END) AS low_line_count
++FROM orders, lineitem
++WHERE o_orderkey = l_orderkey
++  AND l_shipmode IN ('MAIL', 'SHIP')
++  AND l_commitdate < l_receiptdate
++  AND l_shipdate   < l_commitdate
++  AND l_receiptdate >= date '1994-01-01'
++  AND l_receiptdate <  date '1994-01-01' + interval '1 year'
++GROUP BY l_shipmode
++ORDER BY l_shipmode;

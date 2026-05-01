@@ -1,0 +1,9 @@
+diff --git a/contrib/auto_index/auto_index.control b/contrib/auto_index/auto_index.control
+new file mode 100644
+index 0000000000..01bf21e888
+--- /dev/null
++++ b/contrib/auto_index/auto_index.control
+@@ -0,0 +1,3 @@
++default_version = '1.0'
++module_pathname = '$libdir/auto_index'
++relocatable = false

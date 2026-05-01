@@ -1,0 +1,37 @@
+diff --git a/scripts/tpcc_xn/payment.sql b/scripts/tpcc_xn/payment.sql
+new file mode 100644
+index 0000000000..458e10d616
+--- /dev/null
++++ b/scripts/tpcc_xn/payment.sql
+@@ -0,0 +1,31 @@
++-- TPC-C Payment (simplified): write-heavy.  Updates warehouse, district,
++-- customer counters.  60% of payments look up customer by last name
++-- (the canonical TPC-C "by last name" pattern).
++\set wh         random(1, :scale)
++\set dist       random(1, 10)
++\set cust       random(1, 3000)
++\set amount     random(1, 5000)
++\set lookup_by_last  random(1, 100)
++
++UPDATE warehouse SET w_ytd = w_ytd + :amount WHERE w_id = :wh;
++
++UPDATE district  SET d_ytd = d_ytd + :amount
++WHERE d_w_id = :wh AND d_id = :dist;
++
++\if :lookup_by_last <= 60
++    -- 60%: lookup by last name (writes go through SeqScan since c_last is unindexed)
++    UPDATE customer
++       SET c_balance      = c_balance      - :amount,
++           c_ytd_payment  = c_ytd_payment  + :amount,
++           c_payment_cnt  = c_payment_cnt  + 1
++     WHERE c_w_id = :wh AND c_d_id = :dist
++       AND c_last = (ARRAY['BARBAR','OUGHTBAR','ABLEBAR','PRIBAR','PRESBAR'])
++                      [random(1, 5)];
++\else
++    -- 40%: by primary key
++    UPDATE customer
++       SET c_balance      = c_balance      - :amount,
++           c_ytd_payment  = c_ytd_payment  + :amount,
++           c_payment_cnt  = c_payment_cnt  + 1
++     WHERE c_w_id = :wh AND c_d_id = :dist AND c_id = :cust;
++\endif

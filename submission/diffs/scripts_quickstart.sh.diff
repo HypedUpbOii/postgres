@@ -1,0 +1,147 @@
+diff --git a/scripts/quickstart.sh b/scripts/quickstart.sh
+new file mode 100755
+index 0000000000..b9438ce902
+--- /dev/null
++++ b/scripts/quickstart.sh
+@@ -0,0 +1,141 @@
++#!/bin/bash
++#
++# One-command bootstrap for the auto_index project.
++#
++# From a clean clone on a host that has Docker + Compose v2:
++#
++#   scripts/quickstart.sh
++#
++# Walks the full pipeline:
++#   1. docker container up        (idempotent)
++#   2. PostgreSQL build + install (skipped if already installed)
++#   3. data dir init + server start (idempotent)
++#   4. auto_index extension build + load
++#   5. smoke test: a quick pgbench run that demonstrates the live TPS
++#      step when auto_index creates the index mid-run.
++#
++# Each phase is checked before the next runs.  If a phase fails the
++# script stops and prints how to look at logs.
++#
++set -e
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
++CONTAINER="pg-dev"
++
++cd "$REPO_ROOT"
++
++SEP="================================================================"
++banner() { echo ""; echo "$SEP"; echo "  $1"; echo "$SEP"; }
++ok()     { echo "  ✓ $1"; }
++fail()   { echo ""; echo "  ✗ $1" >&2; echo "" >&2; echo "  See logs with: scripts/run.sh logs" >&2; exit 1; }
++
++# ---------------------------------------------------------------------------
++# Sanity: docker + compose v2 available?
++# ---------------------------------------------------------------------------
++banner "Phase 0: host sanity"
++
++command -v docker >/dev/null || fail "docker not found on PATH (install Docker Engine 20+)"
++docker compose version >/dev/null 2>&1 || fail "docker compose v2 plugin not found (install the compose plugin)"
++ok "docker $(docker --version | awk '{print $3}' | tr -d ',') and compose v2 present"
++
++# ---------------------------------------------------------------------------
++# Phase 1: container up
++# ---------------------------------------------------------------------------
++banner "Phase 1: docker container"
++
++scripts/build.sh docker
++docker compose ps "$CONTAINER" 2>/dev/null | grep -q "Up\|running" \
++    || fail "container $CONTAINER did not come up"
++ok "container $CONTAINER is up"
++
++# ---------------------------------------------------------------------------
++# Phase 2: PG build (skip if already installed via the named volume)
++# ---------------------------------------------------------------------------
++banner "Phase 2: PostgreSQL build"
++
++if docker compose exec -T "$CONTAINER" test -x /usr/local/pgsql/bin/postgres; then
++    ok "/usr/local/pgsql/bin/postgres already present (skipping rebuild)"
++else
++    scripts/build.sh pg
++    docker compose exec -T "$CONTAINER" test -x /usr/local/pgsql/bin/postgres \
++        || fail "PG build did not produce /usr/local/pgsql/bin/postgres"
++    ok "PostgreSQL built and installed"
++fi
++
++# ---------------------------------------------------------------------------
++# Phase 3: data dir init + server start (idempotent)
++# ---------------------------------------------------------------------------
++banner "Phase 3: data dir + server"
++
++if [ -f "$REPO_ROOT/data/PG_VERSION" ]; then
++    ok "data dir already initialised"
++    # Make sure the server is running.
++    if docker compose exec -T "$CONTAINER" \
++            bash -c "/usr/local/pgsql/bin/pg_ctl -D /postgres/data status" \
++            >/dev/null 2>&1; then
++        ok "server already running"
++    else
++        echo "  starting server ..."
++        scripts/run.sh start >/dev/null
++        ok "server started"
++    fi
++else
++    scripts/build.sh init
++    [ -f "$REPO_ROOT/data/PG_VERSION" ] || fail "init did not create data/PG_VERSION"
++    ok "data dir initialised + server started"
++fi
++
++# ---------------------------------------------------------------------------
++# Phase 4: extension build + load
++# ---------------------------------------------------------------------------
++banner "Phase 4: auto_index extension"
++
++scripts/build.sh ext
++
++# Confirm the extension is actually loaded in postgres
++EXT_OK=$(docker compose exec -T "$CONTAINER" \
++    /usr/local/pgsql/bin/psql -d postgres -X -Atqc \
++    "SELECT extname FROM pg_extension WHERE extname='auto_index'" 2>/dev/null || echo "")
++[ "$EXT_OK" = "auto_index" ] || fail "auto_index not registered in pg_extension"
++ok "auto_index extension loaded"
++
++# Confirm the bgworker is actually running
++WORKER_OK=$(docker compose exec -T "$CONTAINER" \
++    /usr/local/pgsql/bin/psql -d postgres -X -Atqc \
++    "SELECT count(*) FROM pg_stat_activity WHERE backend_type='auto_index'" 2>/dev/null || echo 0)
++if [ "$WORKER_OK" != "1" ]; then
++    echo "  ! auto_index bgworker not visible in pg_stat_activity (continuing anyway)"
++else
++    ok "auto_index bgworker is alive"
++fi
++
++# ---------------------------------------------------------------------------
++# Phase 5: smoke test — quick pgbench live-step demo
++# ---------------------------------------------------------------------------
++banner "Phase 5: smoke test (pgbench live demo)"
++
++echo "  running a 20-second pgbench: TPS should jump from a few hundred"
++echo "  to ~17 000 around t=6s when auto_index creates the index."
++echo ""
++
++# Use a trimmed pgbench config so the smoke test is fast.
++ROWS=200000 DURATION=20 CLIENTS=4 JOBS=2 PROGRESS=2 \
++    scripts/benchmark.sh pgbench 2>&1 | tail -25
++
++# ---------------------------------------------------------------------------
++# Done
++# ---------------------------------------------------------------------------
++banner "Quickstart complete"
++
++cat <<'EOF'
++
++Try next:
++    scripts/run.sh psql -c "SELECT * FROM auto_index_catalog"
++    scripts/benchmark.sh tpch
++    scripts/benchmark.sh tpcc
++    scripts/demo.sh
++
++Full reference:  setup.md
++Quick reference: QUICKSTART.md
++EOF

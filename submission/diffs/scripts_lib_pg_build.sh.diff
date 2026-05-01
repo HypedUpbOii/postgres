@@ -1,0 +1,26 @@
+diff --git a/scripts/lib/pg_build.sh b/scripts/lib/pg_build.sh
+new file mode 100755
+index 0000000000..dccec349e0
+--- /dev/null
++++ b/scripts/lib/pg_build.sh
+@@ -0,0 +1,20 @@
++#!/bin/bash
++# In-container: configure + make + install PostgreSQL.
++#
++# --enable-debug only adds -g symbols; keeps -O2 (fine for benchmarks).
++# --enable-cassert adds runtime assertion checks (~15-30% overhead) —
++# keep on during development; remove for final benchmark numbers.
++set -e
++
++cd /postgres
++./configure \
++    --prefix=/usr/local/pgsql \
++    --enable-debug \
++    --enable-cassert \
++    --with-llvm \
++    --with-lz4 \
++    --with-zstd \
++    --with-liburing
++
++make -j"$(nproc)"
++make install

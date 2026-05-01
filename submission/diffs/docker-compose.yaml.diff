@@ -1,0 +1,27 @@
+diff --git a/docker-compose.yaml b/docker-compose.yaml
+new file mode 100644
+index 0000000000..668d2d7bd1
+--- /dev/null
++++ b/docker-compose.yaml
+@@ -0,0 +1,20 @@
++services:
++  pg-dev:
++    build: .
++    container_name: postgres-dev
++    volumes:
++      - .:/postgres
++      # Persist the PG install across container recreates (e.g. when this
++      # compose file changes).  Without this, `docker compose up -d` after
++      # any edit nukes /usr/local/pgsql and forces a full rebuild.
++      - pg_install:/usr/local/pgsql
++    working_dir: /postgres
++    # PostgreSQL's parallel hash joins back their shared hash table with
++    # POSIX shm under /dev/shm; Docker's 64 MB default is too small and
++    # parallel workers fail with "could not resize shared memory segment".
++    shm_size: 1g
++    tty: true
++    stdin_open: true
++
++volumes:
++  pg_install:
+\ No newline at end of file

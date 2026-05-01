@@ -1,0 +1,22 @@
+diff --git a/contrib/auto_index/Makefile b/contrib/auto_index/Makefile
+new file mode 100644
+index 0000000000..45fd3b6111
+--- /dev/null
++++ b/contrib/auto_index/Makefile
+@@ -0,0 +1,16 @@
++MODULE_big = auto_index
++OBJS = auto_index.o
++EXTENSION = auto_index
++DATA = auto_index--1.0.sql
++PGFILEDESC = "auto_index - automatic index management"
++
++ifdef USE_PGXS
++PG_CONFIG = pg_config
++PGXS := $(shell $(PG_CONFIG) --pgxs)
++include $(PGXS)
++else
++subdir = contrib/auto_index
++top_builddir = ../..
++include $(top_builddir)/src/Makefile.global
++include $(top_builddir)/contrib/contrib-global.mk
++endif

@@ -1,0 +1,262 @@
+diff --git a/setup.md b/setup.md
+new file mode 100644
+index 0000000000..314d02d52f
+--- /dev/null
++++ b/setup.md
+@@ -0,0 +1,256 @@
++# Development Setup
++
++This project hacks on PostgreSQL internals — specifically a custom `auto_index`
++extension that automatically creates and drops indexes based on observed
++workloads — inside a Docker container so your host system stays clean and
++everyone gets an identical build environment.
++
++## Prerequisites
++
++- [Docker](https://docs.docker.com/get-docker/) (Engine 20+ or Docker Desktop)
++- [Docker Compose](https://docs.docker.com/compose/install/) (v2 — `docker compose`, not `docker-compose`)
++
++No other dependencies are required on your host machine.
++
++## Directory layout
++
++```
++.
++├── Dockerfile             # Ubuntu 22.04 image with all build deps
++├── docker-compose.yaml    # Dev container definition
++├── contrib/auto_index/    # The extension (auto_index.{c,h}, .sql, control)
++├── scripts/
++│   ├── build.sh           # build / clean / install
++│   ├── run.sh             # manual ops: start, stop, psql, logs, ...
++│   ├── benchmark.sh       # run pgbench / TPC-H / TPC-C / strategy comparison
++│   ├── demo.sh            # heavy-reads-then-heavy-writes lifecycle showcase
++│   ├── lib/               # in-container helpers called by the entry scripts
++│   ├── tpch_schema.sql, tpch_queries/        # TPC-H schema + 8 queries
++│   └── tpcc_schema.sql, tpcc_load.sql, tpcc_xn/   # TPC-C-lite OLTP workload
++├── report/                # design notes, internals research
++└── src/                   # PostgreSQL source tree
++```
++
++## First-time setup
++
++The fastest path from a clean checkout to a running server with the extension
++loaded is:
++
++```bash
++scripts/build.sh all
++```
++
++That single command does everything below in sequence. If you'd rather do it
++step by step:
++
++### 1. Build the Docker image and start the container
++
++```bash
++scripts/build.sh docker
++```
++
++Installs all compile-time dependencies (OpenSSL, ICU, libxml2, etc.) into the
++image and starts the container. The container mounts the repository at
++`/postgres` inside it, so edits on your host are immediately visible.
++
++### 2. Build PostgreSQL
++
++```bash
++scripts/build.sh pg
++```
++
++Runs `./configure`, `make -j$(nproc)`, and `make install` with the prefix
++`/usr/local/pgsql` inside the container. ~3–5 minutes on first run; seconds on
++incremental rebuilds.
++
++### 3. Initialise the data dir and start the server
++
++```bash
++scripts/build.sh init
++```
++
++On the first run this calls `initdb`, sets `shared_preload_libraries =
++'auto_index'`, and starts the server. Idempotent — safe to re-run.
++
++### 4. Build and load the auto_index extension
++
++```bash
++scripts/build.sh ext
++```
++
++Compiles the extension, copies the SQL into the install dir, restarts the
++server, and `DROP + CREATE EXTENSION` to refresh the catalog. Run this after
++editing any file in `contrib/auto_index/`.
++
++---
++
++## Using the scripts
++
++Four entry scripts cover everything you'll typically need:
++
++### `scripts/build.sh <command>` — build and clean
++
++| Command | What it does |
++|---|---|
++| `docker` | Bring up the docker container (idempotent). |
++| `pg`     | Build and install PostgreSQL inside the container. |
++| `init`   | Initialise the data dir and start the server (first time). |
++| `ext`    | Rebuild and reload the `auto_index` extension. |
++| `clean`  | Drop test tables, drop auto-created indexes, reset extension state and GUCs. |
++| `all`    | `docker` + `pg` + `init` + `ext` (full setup from scratch). |
++
++Common flows:
++
++```bash
++scripts/build.sh all                    # first-time setup
++scripts/build.sh ext                    # rebuild after editing C code
++scripts/build.sh clean                  # wipe demo/benchmark state
++```
++
++### `scripts/run.sh <command>` — manual operations
++
++| Command | What it does |
++|---|---|
++| `start`            | Start the server. |
++| `stop`             | Stop the server (fast shutdown). |
++| `restart`          | Restart the server. |
++| `status`           | Show server status. |
++| `psql [args...]`   | Drop into psql (or run a one-off SQL). Args are forwarded. |
++| `logs`             | `tail -f /postgres/logfile`. |
++| `shell`            | Bash shell inside the container. |
++| `reload`           | `SELECT pg_reload_conf()` — pick up `ALTER SYSTEM` changes. |
++
++Examples:
++
++```bash
++scripts/run.sh psql                                       # interactive shell
++scripts/run.sh psql -c "SHOW auto_index.create_strategy"  # one-off
++scripts/run.sh psql -c "SELECT * FROM auto_index_catalog" # inspect catalog
++scripts/run.sh logs                                       # watch bgworker logs
++scripts/run.sh shell                                      # poke around the container
++```
++
++### `scripts/benchmark.sh <bench> [args]` — run benchmarks
++
++| Sub-command       | What it does |
++|---|---|
++| `pgbench`         | Live demo: ~50K-row table, 4 clients hitting `WHERE category = ?`. Watch the per-2s TPS jump when `auto_index` creates the index mid-run (~50–60×). |
++| `tpch [setup]`    | TPC-H 3-phase benchmark: baseline → training → indexed. Auto-runs setup if data is missing; `tpch setup` forces re-load. |
++| `tpcc`            | TPC-C-lite OLTP benchmark using pgbench. Demonstrates that `auto_index` doesn't over-index a write-heavy workload. |
++| `strategies`      | Run all six create-strategies on TPC-H and print a single comparison table with per-query speedups, geomean, and index counts. |
++
++Tunables (env vars):
++
++| Var | Default | Applies to |
++|---|---|---|
++| `ITERATIONS` | 1 | per-query repetitions (median of N) |
++| `CHECK_INTERVAL` | 5 | bgworker wake interval (seconds) |
++| `THRESHOLD` | 2 | `auto_index.threshold` |
++| `SIMPLE_THRESHOLD` | 5 | `auto_index.simple_threshold` |
++| `WAIT_FOR_BGWORKER` | 20 | seconds to wait after the training phase |
++| `TRAINING_PASSES` | 3 | how many query passes to run during training |
++| `SF` | 0.1 | TPC-H scale factor (0.1 / 1 / 10) |
++| `STRATEGY` | `ratio_only` | TPC-C strategy override |
++
++Examples:
++
++```bash
++scripts/benchmark.sh pgbench                       # live TPS jump demo
++SF=1 scripts/benchmark.sh tpch                     # ~6M-row TPC-H
++scripts/benchmark.sh tpch setup                    # force re-load TPC-H data
++scripts/benchmark.sh strategies                    # compare all 6 strategies
++SCALE=4 DURATION_S=60 scripts/benchmark.sh tpcc    # bigger TPC-C run
++```
++
++### `scripts/demo.sh` — lifecycle showcase
++
++A self-contained ~90-second demo that proves the whole pipeline end-to-end:
++
++1. **Phase A — heavy reads** with both single-column and three-column predicate
++   patterns. The bgworker creates a SINGLETON index on `category` and a
++   COMPOSITE index on `(region, status, amount)`.
++2. **Phase B — heavy writes** (UPDATE/INSERT/DELETE on the PK only — never
++   touching the indexed columns). The ski-rental drop accumulator grows each
++   bgworker cycle until it crosses the threshold, then both indexes are
++   dropped.
++
++Tunables (env vars):
++
++| Var | Default | What |
++|---|---|---|
++| `ROWS` | 50000 | rows in the demo table |
++| `READ_ITERS` | 200 | SELECT iterations per pattern |
++| `WRITE_ITERS` | 300 | write iterations during phase B |
++| `IDLE_INTERVALS` | 10 | how many bgworker cycles to wait for drop |
++| `STRATEGY` | `simple_threshold` | for predictable triggers |
++| `SIMPLE_THRESHOLD` | 10 | benefit needed to fire under simple_threshold |
++
++Examples:
++
++```bash
++scripts/demo.sh                                    # default 90s run
++ROWS=200000 scripts/demo.sh                        # bigger table, larger
++                                                   # drop accumulator window
++IDLE_INTERVALS=20 scripts/demo.sh                  # be more patient on drop
++```
++
++The demo prints a verdict at the end: `✓ DEMO PASSED` if both index types
++were created and then dropped.
++
++---
++
++## Common workflows
++
++**After editing `auto_index.c`/`.h`/`.sql`**:
++
++```bash
++scripts/build.sh ext      # rebuild + restart + DROP/CREATE EXTENSION
++scripts/run.sh logs       # watch bgworker activity in another terminal
++```
++
++**Reset everything between experiments**:
++
++```bash
++scripts/build.sh clean    # drop test tables, reset state, reset GUCs
++```
++
++**Try a different create strategy**:
++
++```bash
++scripts/run.sh psql -c "ALTER SYSTEM SET auto_index.create_strategy = 'ratio_only'"
++scripts/run.sh reload
++scripts/benchmark.sh tpch
++```
++
++**Edit and rebuild PostgreSQL itself** (rare):
++
++```bash
++# Inside the container (scripts/run.sh shell)
++make -C src/backend          # or whichever subdirectory changed
++make install
++exit
++
++# Restart the server
++scripts/run.sh restart
++```
++
++## Stopping and tearing down
++
++Stop the server but keep the container around:
++
++```bash
++scripts/run.sh stop
++```
++
++Stop and remove the container (data, logs, and source edits persist on your
++host):
++
++```bash
++docker compose down
++```
++
++Also remove the image:
++
++```bash
++docker compose down --rmi local
++```
