@@ -54,12 +54,19 @@ ok "container $CONTAINER is up"
 # ---------------------------------------------------------------------------
 banner "Phase 2: PostgreSQL build"
 
-if docker compose exec -T "$CONTAINER" test -x /usr/local/pgsql/bin/postgres; then
+# The binary lives in the persistent pg_install volume, but the contrib
+# extension build needs src/Makefile.global in the source tree (bind-mounted
+# from the host).  After a fresh clone the volume can hold a stale install
+# while the source tree is unconfigured — require both before skipping.
+if docker compose exec -T "$CONTAINER" test -x /usr/local/pgsql/bin/postgres \
+   && [ -f "$REPO_ROOT/src/Makefile.global" ]; then
     ok "/usr/local/pgsql/bin/postgres already present (skipping rebuild)"
 else
     scripts/build.sh pg
     docker compose exec -T "$CONTAINER" test -x /usr/local/pgsql/bin/postgres \
         || fail "PG build did not produce /usr/local/pgsql/bin/postgres"
+    [ -f "$REPO_ROOT/src/Makefile.global" ] \
+        || fail "PG build did not produce src/Makefile.global (configure failed?)"
     ok "PostgreSQL built and installed"
 fi
 
