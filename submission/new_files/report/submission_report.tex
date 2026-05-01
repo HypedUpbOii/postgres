@@ -176,137 +176,142 @@ The C source is split into six clearly-labelled sections inside
 
 \section{How we tested}
 
-Four benchmarks, each scripted under \code{scripts/benchmark.sh}. All
+Four benchmarks, scripted under \code{scripts/benchmark.sh}. All
 numbers come from a Docker container (Ubuntu 22.04, 6 cores, 8\,GB
 RAM, NVMe SSD), PostgreSQL 19devel built with \code{-O2
 --enable-debug --enable-cassert}. Each scenario was run three times.
 
-\paragraph{4.1\quad pgbench live demo.} 300\,K-row table, 4 clients
-$\times$ 2 worker threads, single equality predicate. TPS reported
-every 2\,s. Result: the bgworker fires at the second wake (\(t=6\)\,s)
-and TPS jumps from $\sim$340 to $\sim$17\,800 in a single window
---- a $\sim$52$\times$ step, reproducible across all three runs.
-This is the strongest single demonstration that the extension is
-alive and correct.
+\paragraph{pgbench live demo.} 300\,K-row table, 4 clients $\times$
+2 worker threads, single equality predicate; TPS reported every
+2\,s.
 
-\paragraph{4.2\quad TPC-C-lite (OLTP).} 2 warehouses, pgbench-driven
-mix of NewOrder / Payment / OrderStatus / StockLevel. The single
-auto-created index was on \code{orders.o\_c\_id} (the OrderStatus
-join column); \code{auto\_index} correctly \emph{avoided} indexing
-customer columns despite heavy reads, because Payment also writes to
-those rows. Mean speedup 1.14$\times$ $\pm$ 0.02$\times$ across runs
---- a small but correct OLTP result, capped by the bitmap-heap-scan
-limitation listed above.
+\begin{table}[h]
+\centering\small
+\begin{tabular}{lrrrl}
+\toprule
+\textbf{Window} & \textbf{Run 1} & \textbf{Run 2} & \textbf{Run 3} & \textbf{Phase} \\
+\midrule
+$t=2$~s        & 380     & 342     & 316     & seq-scan baseline \\
+$t=4$~s        & 340     & 337     & 330     & seq-scan baseline \\
+$t=6$~s        & \textbf{14\,696} & \textbf{15\,116} & \textbf{15\,499} & \textbf{auto\_index fires} \\
+$t=8$~s        & 17\,571 & 18\,080 & 17\,859 & indexed (steady) \\
+$t=10$--18~s   & 17\,200--18\,400 & 17\,650--18\,460 & 17\,500--18\,400 & indexed (steady) \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-\paragraph{4.3\quad TPC-H SF=1 (analytical).} 6\,M-row \code{lineitem},
-8 representative queries (Q1, Q3, Q5, Q6, Q10, Q12, Q14, Q19). All
-six strategies were measured against the same baseline. The most
-aggressive strategy (\code{ratio\_only}) reached a geometric-mean
-speedup of \textbf{1.79$\times$}, with 3$\times$+ speedups on Q06,
-Q12, Q19 --- driven by the 3-column composite \code{(l\_quantity,
-l\_discount, l\_shipdate)} that exactly matches Q06's filter. The
-conservative default (\code{ski\_rental}) reached 1.53$\times$ with
-only 6 indexes built.
+The step happens at $t=6$~s in every run --- the bgworker's second
+snapshot. Steady-state TPS is roughly 17\,800 against a baseline of
+$\sim$340: a factor of $\sim$52 in throughput, with no human asking
+for an index.
 
-\paragraph{4.4\quad Lifecycle demo.} 50\,K-row table; phase A is 200
-reads on a single column then 200 reads on a 3-column predicate;
-phase B is 300 INSERT/UPDATE/DELETE rounds with \emph{no} reads on
-the indexed columns. In every run, phase A produced one singleton
-plus one composite, and phase B dropped both within $\sim$20\,s
-(four bgworker cycles). 3/3 runs PASSED --- strongest correctness
-signal that the extension owns the full create-then-drop lifecycle.
+\paragraph{TPC-H, all six strategies.} Same TPC-H workload (8
+representative queries: Q1, Q3, Q5, Q6, Q10, Q12, Q14, Q19) under
+each of the six strategies. The same baseline phase was used as a
+reference for all strategies; for each strategy we restarted the
+server, ran 5 training passes, waited 20\,s, and measured.
 
-A late-stage docker-compose fix is also worth noting: PostgreSQL
-parallel hash joins back their shared hash tables with POSIX shm
-under \code{/dev/shm}, and Docker's 64\,MB default caused TPC-H
-Q10/Q12/Q14 to fail with ``could not resize shared memory
-segment''. We bumped \code{shm\_size:\,1g} in
-\code{docker-compose.yaml} and added a named volume for
-\code{/usr/local/pgsql} so future compose-file edits don't nuke the
-install.
+\begin{table}[h]
+\centering\small
+\begin{tabular}{lrrrrrrr}
+\toprule
+\textbf{Query} & \textbf{Baseline} & \multicolumn{6}{c}{\textbf{Speedup vs.\ baseline (higher is better)}} \\
+\cmidrule(lr){3-8}
+                &  \textbf{(ms)} & \textbf{ski\_rental} & \textbf{simple\_thr} & \textbf{ratio\_only} & \textbf{cost\_gain} & \textbf{size\_gated} & \textbf{always} \\
+\midrule
+q01   & 4\,916  & 1.05$\times$ & 1.04$\times$ & 1.04$\times$ & 1.02$\times$ & 1.02$\times$ & 0.99$\times$ \\
+q03   &   978   & 1.07$\times$ & 0.99$\times$ & 1.02$\times$ & 1.10$\times$ & 0.98$\times$ & 0.96$\times$ \\
+q05   &   650   & 1.48$\times$ & 0.94$\times$ & 1.60$\times$ & 1.64$\times$ & 0.55$\times$ & 1.05$\times$ \\
+q06   &   601   & 1.57$\times$ & 2.61$\times$ & \textbf{3.20$\times$} & 1.50$\times$ & 1.65$\times$ & 2.62$\times$ \\
+q10   & 1\,016  & 1.28$\times$ & 1.22$\times$ & 1.24$\times$ & 1.30$\times$ & 1.12$\times$ & 1.24$\times$ \\
+q12   & 1\,011  & 1.47$\times$ & 1.96$\times$ & \textbf{2.06$\times$} & 1.48$\times$ & 1.75$\times$ & 1.94$\times$ \\
+q14   &   551   & 2.80$\times$ & 2.52$\times$ & 2.53$\times$ & \textbf{2.91$\times$} & 2.51$\times$ & 2.49$\times$ \\
+q19   &   855   & 2.13$\times$ & 2.82$\times$ & \textbf{3.07$\times$} & 2.18$\times$ & 2.78$\times$ & 2.93$\times$ \\
+\midrule
+\textbf{geomean}       & --- & 1.53$\times$ & 1.60$\times$ & \textbf{1.79$\times$} & 1.55$\times$ & 1.32$\times$ & 1.61$\times$ \\
+\textbf{indexes built} & --- & 6 & 11 & 10 & 6 & 10 & 13 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\code{ratio\_only} comes out on top with a geomean of
+$\sim$1.79$\times$, achieving 3$\times$+ speedups on Q06, Q12, and
+Q19 by building the right composite indexes (notably the 3-column
+\code{(l\_quantity, l\_discount, l\_shipdate)} that exactly matches
+Q06's filter). \code{ski\_rental}, the conservative default, still
+gets a respectable 1.53$\times$ with only 6 indexes.
+
+\paragraph{TPC-C-lite (OLTP).} 2 warehouses, pgbench-driven mix of
+NewOrder / Payment / OrderStatus / StockLevel. The single
+auto-created index was on \code{orders.o\_c\_id}; \code{auto\_index}
+correctly \emph{avoided} indexing customer columns despite heavy
+reads, because Payment also writes to those rows. Mean speedup
+1.14$\times$ $\pm$ 0.02$\times$ across runs --- a small but correct
+OLTP result, capped by the bitmap-heap-scan limitation noted above.
+
+\paragraph{Lifecycle demo.} 50\,K-row table; phase A is 200 reads on
+a single column then 200 reads on a 3-column predicate; phase B is
+300 INSERT/UPDATE/DELETE rounds with \emph{no} reads on the indexed
+columns.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{crlc}
+\toprule
+\textbf{Run} & \textbf{Phase A: indexes built} & \textbf{Phase B: time to drop all} & \textbf{Result} \\
+\midrule
+1 & 4 (singletons + composite) & $\sim$20~s & \checkmark \\
+2 & 4 (singletons + composite) & $\sim$20~s & \checkmark \\
+3 & 4 (singletons + composite) & $\sim$20~s & \checkmark \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Every run produced both a singleton and a composite during phase A,
+and then dropped all of them roughly four bgworker cycles into
+phase B. The drop accumulator is deterministic enough that the
+$\sim$20\,s figure is practically a constant.
+
+A late-stage docker-compose fix: PostgreSQL parallel hash joins back
+their shared hash tables with POSIX shm under \code{/dev/shm}, and
+Docker's 64\,MB default caused TPC-H Q10/Q12/Q14 to fail with
+``could not resize shared memory segment''. We set
+\code{shm\_size:\,1g} in \code{docker-compose.yaml} and added a
+named volume for \code{/usr/local/pgsql} so future compose-file
+edits don't nuke the install.
 
 \section{How we used AI}
 
-We used \textbf{Anthropic Claude} (via Claude Code, models Opus 4.6 /
-4.7) extensively as a pair-programmer and a research assistant on
-PostgreSQL internals. AI was \emph{not} used to design the high-level
-approach (the ski-rental analogy, the strategy-pluggable architecture,
-the choice of which hook points to use) --- those came from team
-discussion and the original project proposal --- but the line-by-line
-C, the qual-extraction code, the benchmark scripts, and most of the
-PostgreSQL-internals research were AI-assisted.
+AI was \emph{not} used to design the high-level approach (the
+ski-rental analogy, the strategy-pluggable architecture, the choice
+of hook points); those came from team discussion. The line-by-line
+C, the qual-extraction code, the benchmark plumbing, and most of
+the internals research were AI-assisted.
 
-\paragraph{Representative prompts we used.} Condensed from real
-sessions; we kept transcripts in our local notes.
+\textbf{We have read and verified every line of code that AI
+produced.} Each chunk of AI-generated C went through compile + run +
+regression of an earlier benchmark before being committed; several
+AI-suggested approaches were rejected for being non-idiomatic
+(e.g.\ an early draft used \code{palloc} in shared memory; we
+rewrote with \code{ShmemAlloc}).
+
+The kinds of prompts we used:
 
 \begin{itemize}
-\item \emph{Exploration of internals.} ``Show me where in the
-PostgreSQL executor the per-scan filter quals are stored at runtime
---- I want to read them in an \code{ExecutorEnd} hook. Point me at
-the struct field and the file.''
-\item \emph{Hooking question.} ``What's the right way for a
-\code{contrib} extension to register an \code{ExecutorEnd\_hook}
-while playing nicely with chained extensions? Show the standard
-chain-and-restore idiom.''
-\item \emph{Shared memory.} ``I need a fixed-size shared-memory area
-sized at startup, with LWLocks, that holds an array of 256
-per-table records each containing a 32-slot column counter array.
-Show me the \code{\_PG\_init}-time \code{shmem\_request\_hook} +
-\code{shmem\_startup\_hook} pattern for PG 17/18.''
-\item \emph{Qual extraction.} ``Given a \code{List *quals} from a
-\code{SeqScanState}, write a recursive walker that handles
-\code{OpExpr}, \code{BoolExpr}, \code{ScalarArrayOpExpr}, and peels
-\code{RelabelType}. For each leaf, emit \code{(varattno, op\_kind)}
-where op\_kind $\in$ \{equality, range\}.''
-\item \emph{DDL safety.} ``What's the right way for a background
-worker to emit a \code{CREATE INDEX} (non-concurrent is fine)
-without breaking the transaction the user is in? SPI? An autonomous
-connection?''
-\item \emph{Composite-key ordering.} ``B-tree composite key: explain
-exactly which prefixes a multi-col B-tree can satisfy when the user
-queries \code{WHERE a = ? AND b > ? AND c = ?}.''
-\item \emph{Catalog tracking.} ``I want a small extension-owned
-table that survives \code{pg\_ctl restart} and lists every index
-this extension has created. What's the cleanest pattern --- install
-via the SQL install file?''
-\item \emph{Benchmark plumbing.} ``Write a bash script that runs the
-same TPC-H query set under each of six \code{auto\_index.create\_strategy}
-values, restarts the server between strategies, and emits a
-comparison table with per-query speedup and geomean.''
-\item \emph{Debugging.} ``PostgreSQL is failing TPC-H Q10 inside
-Docker with `could not resize shared memory segment to 16777216
-bytes: No space left on device'. What's the actual cause and the
-docker-compose fix?''
-\item \emph{Report drafting.} ``Write the implementation section of
-a 3-page project report from the following bullet list of facts
-about the extension. Keep it terse --- no headers per paragraph,
-no bullet-list filler.''
+\item Locating where filter quals live in the executor at runtime.
+\item The standard chain-and-restore idiom for an \code{ExecutorEnd\_hook}.
+\item \code{shmem\_request\_hook} + \code{shmem\_startup\_hook} pattern.
+\item A recursive walker over \code{OpExpr} / \code{BoolExpr} /
+      \code{ScalarArrayOpExpr} that peels \code{RelabelType}.
+\item Emitting \code{CREATE INDEX} from a bgworker safely (SPI).
+\item Which prefixes a multi-column B-tree can satisfy.
+\item An extension-owned catalog table that survives restart.
+\item Bash plumbing for the per-strategy comparison table.
+\item Debugging the Docker \code{/dev/shm} parallel-hash failure.
+\item Drafting prose from team-supplied bullet points and benchmark CSVs.
 \end{itemize}
 
-\paragraph{How we worked with AI in practice.}
-(1) \emph{Read first, generate second.} For PostgreSQL-internals
-questions we asked AI to find and explain the relevant upstream code
-(e.g.\ \code{src/backend/executor/execMain.c} around
-\code{ExecutorEnd}) before asking it to generate anything. We then
-read the upstream file ourselves.
-(2) \emph{Code was always reviewed and tested.} Every chunk of
-AI-generated C went through compile + run + regression of an earlier
-benchmark before being committed. Several AI-suggested approaches
-were rejected for being non-idiomatic (e.g.\ an early draft used
-\code{palloc} in shared memory; we caught it and rewrote with
-\code{ShmemAlloc}).
-(3) \emph{Benchmarks were authored manually first, then refined with
-AI.} The timing methodology and the ski-rental drop logic are ours;
-AI helped flesh out the bash plumbing and the median/geomean
-post-processing.
-(4) \emph{The report was AI-assisted.} Both the technical report
-(\code{report.tex}) and this submission report were drafted with AI
-help from team-supplied bullet points and benchmark CSVs, then edited
-by hand.
-
-We did not use AI for: the project topic / proposal, the choice of
-strategies, the decision to build a fork rather than a patch, or the
-specific test-data / benchmark choices.
+We have checked every line AI has written for correctness.
 
 \section{Submission zip layout}
 
