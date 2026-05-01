@@ -79,10 +79,28 @@ ls -lh "$DATA_DIR"/*.tbl | awk '{print "  " $9 "  " $5}'
 # ---------------------------------------------------------------------------
 banner "Step 3: creating schema (PKs only, no secondary indexes)"
 
-# If lineitem already exists AND has rows AND we're not forcing reload, skip.
+# Decide whether to (re)load.
+#
+# We have to be defensive here because TPC-C's schema drops `customer`
+# and `orders` CASCADE and recreates them with completely different
+# columns (c_w_id, c_d_id, ... vs. TPC-H's c_custkey, c_name, ...).
+# A naive "lineitem has rows -> skip" check passes after a TPC-C run
+# even though the rest of the TPC-H schema is gone, breaking every
+# query that touches customer / orders.
+#
+# Real check: lineitem has rows AND a TPC-H-specific column on
+# customer (c_custkey) is present.
 EXISTING_ROWS=$($PSQL -Atq -c "SELECT count(*) FROM lineitem" 2>/dev/null || echo 0)
+HAS_TPCH_CUSTOMER=$($PSQL -Atq -c "
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema='public' AND table_name='customer'
+      AND column_name='c_custkey'" 2>/dev/null || echo "")
 
-if [ "$FORCE_RELOAD" = "1" ] || [ "$EXISTING_ROWS" = "0" ]; then
+if [ "$FORCE_RELOAD" = "1" ] || [ "$EXISTING_ROWS" = "0" ] || [ -z "$HAS_TPCH_CUSTOMER" ]; then
+    if [ -z "$HAS_TPCH_CUSTOMER" ] && [ "$EXISTING_ROWS" != "0" ]; then
+        echo "TPC-H lineitem has rows but customer schema is not TPC-H "
+        echo "(probably a TPC-C run clobbered it).  Forcing reload."
+    fi
     $PSQL -f "$SCRIPTS_DIR/tpch_schema.sql"
     echo "Schema created."
 else
