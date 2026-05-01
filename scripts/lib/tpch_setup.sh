@@ -62,10 +62,16 @@ if [ ! -f "$DATA_DIR/lineitem.tbl" ]; then
     # Run inside dbgen dir, then move output.
     (cd "$DBGEN_DIR" && ./dbgen -s "$SF" -f -v 2>&1 | tail -5)
     mv "$DBGEN_DIR"/*.tbl "$DATA_DIR"/
+fi
 
+# dbgen emits a trailing | on every row; PG's COPY treats it as an
+# extra empty column.  Strip it.  Run every time (sed is idempotent) so
+# we recover from a prior run that crashed between dbgen and strip.
+# A prior interrupted run can also leave files with mangled perms, so
+# normalize first.
+chmod u+rw "$DATA_DIR"/*.tbl 2>/dev/null || true
+if grep -lq '|$' "$DATA_DIR"/*.tbl 2>/dev/null; then
     echo "[*] Stripping trailing pipe from .tbl files ..."
-    # dbgen emits a trailing | on every row; PG's COPY treats it as an
-    # extra empty column.  Remove it in place.
     for f in "$DATA_DIR"/*.tbl; do
         sed -i 's/|$//' "$f"
     done
