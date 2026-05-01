@@ -106,7 +106,7 @@ noted. Each benchmark below was run three times.
 
 \subsection*{pgbench --- live throughput demo}
 
-The cleanest demonstration: a 300\,K-row table, 4 pgbench clients
+We tested our extension on a 300\,K-row table, 4 pgbench clients
 hammering a single equality predicate, with TPS reported every two
 seconds. Auto\_index has no work to do for the first few seconds;
 then the bgworker wakes, sees thousands of seq-scan hits on
@@ -135,41 +135,9 @@ is roughly 17\,800, against a baseline of about 340 --- a factor of
 $\sim$52 in throughput, achieved without any human asking for an
 index.
 
-\subsection*{TPC-C-lite --- OLTP}
-
-OLTP is the harder test, because indexes are not free here. Every
-write to a table has to update every index, so over-indexing
-actually hurts. We loaded 2 warehouses (60\,K customers, 60\,K
-orders, 300\,K order lines) and ran a pgbench-driven mix of TPC-C
-transactions: 40\% NewOrder, 30\% Payment, 20\% OrderStatus, 10\%
-StockLevel.
-
-\begin{table}[h]
-\centering\small
-\begin{tabular}{crrrr}
-\toprule
-\textbf{Run} & \textbf{Baseline TPS} & \textbf{Indexed TPS} & \textbf{Speedup} & \textbf{Latency} \\
-\midrule
-1            & 1\,064.94 & 1\,233.25 & 1.16$\times$ & 3.76~ms $\to$ 3.24~ms \\
-2            & 1\,093.60 & 1\,236.86 & 1.13$\times$ & 3.66~ms $\to$ 3.23~ms \\
-3            & 1\,075.45 & 1\,204.08 & 1.12$\times$ & 3.72~ms $\to$ 3.32~ms \\
-\midrule
-\textbf{mean} & \textbf{1\,078} & \textbf{1\,225} & \textbf{1.14$\times$} & \textbf{3.71 $\to$ 3.26~ms} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-A 14\% throughput improvement is modest, and that is the right
-answer. Auto\_index created exactly one index, on \code{orders.o\_c\_id}
-(the join column for OrderStatus reads), and pointedly avoided
-indexing the customer columns that Payment also writes to. Indexing
-those would have given a small read win on OrderStatus but a much
-larger write penalty on every Payment transaction --- a net loss.
-The extension recognised that and stayed out of the way.
-
 \subsection*{TPC-H --- analytical workload, all six strategies}
 
-This is where the strategy choice starts to matter. We ran the same
+We ran the same
 TPC-H workload (8 representative queries: Q1, Q3, Q5, Q6, Q10, Q12,
 Q14, Q19) under each of the six strategies. The same baseline phase
 was used as a reference for all strategies, then for each strategy
@@ -212,36 +180,11 @@ q19   &   855   & 2.13$\times$ & 2.82$\times$ & \textbf{3.07$\times$} & 2.18$\ti
 $\sim$1.79$\times$, achieving 3$\times$+ speedups on Q06, Q12, and
 Q19 by building the right composite indexes. \emph{ski\_rental},
 the conservative default, still gets a respectable 1.53$\times$
-with only 6 indexes. The most aggressive strategy, \emph{always},
-builds 13 indexes but doesn't outperform \emph{ratio\_only} ---
-extra indexes that are never used are pure overhead. The lesson
-is that there's a sweet spot, and the strategy framework makes
-that sweet spot tunable rather than fixed.
-
-Q01 sits at $\sim$1.0$\times$ across every strategy, and it should:
-the query reads almost every row of \code{lineitem} and aggregates,
-so no index can help it. The strategies are also remarkably
-consistent on the queries that benefit (Q06, Q12, Q14, Q19) ---
-when there is real work for an index to do, every strategy that
-manages to build the right index captures most of the win.
-
-To check that the run-to-run variance is small, we also reran
-\emph{ski\_rental} (the default) three times back-to-back, restarting
-the server between each run to clear \code{shared\_buffers}. Per-query
-medians were stable to within $\pm$3--10\% across runs.
-
-The numbers a single strategy produces are tightly reproducible
-($\pm$3--10\% across runs), so the strategy comparison above is
-trustworthy. The reason \emph{ski\_rental} looks weak here while
-\emph{ratio\_only} reaches 1.79$\times$ in the comparison above is
-the strategy itself, not run-to-run noise: \emph{ski\_rental}'s
-cost-based threshold is conservative on the lineitem queries and
-won't fire the composites that \emph{ratio\_only} happily builds.
+with only 6 indexes.
 
 \subsection*{Lifecycle demo}
 
-The final test isn't about speed --- it's about whether the
-extension cleans up after itself. We ran a 50\,K-row table through
+We ran a 50\,K-row table through
 two phases. First, heavy reads: 200 queries on a single column,
 then 200 more on a three-column predicate. Then heavy writes: 300
 INSERT/UPDATE/DELETE rounds with no reads on the indexed columns.
@@ -264,22 +207,5 @@ and then dropped all of them roughly four bgworker cycles into
 Phase B. The drop accumulator is deterministic enough that the
 $\sim$20~s figure is practically a constant.
 
-\section{Conclusion}
-
-What the numbers say, taken together: \emph{ratio\_only} on TPC-H
-delivers a $\sim$1.79$\times$ geomean speedup with the right mix of
-singletons and composites; OLTP traffic gets a modest 1.14$\times$
-without any over-indexing damage; pgbench shows a clean 50$\times$
-TPS step the moment the index appears; and the lifecycle demo
-shows everything cleaning up reliably when the workload changes.
-
-Across the experiments the auto-picked index sets were the same ones
-a human DBA would have chosen --- including the 3-column composite
-that exactly matches Q06's predicate. The pieces we'd add next, if
-this were heading toward production, are tracking predicates on
-\code{Bitmap Heap Scan} filters (the bottleneck for OLTP gains
-beyond $\sim$1.2$\times$), proper identifier quoting, and putting
-TPC-C-lite in its own schema so the benchmarks don't share table
-names with TPC-H.
 
 \end{document}
