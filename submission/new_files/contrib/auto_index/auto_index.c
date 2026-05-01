@@ -1,0 +1,1802 @@
+/*
+ * auto_index — automatic index creation/deletion for PostgreSQL.
+ *
+ * The file is split into six sections — search for these markers to jump:
+ *
+ *   1. MODULE INIT & GUCs
+ *   2. SHARED MEMORY      — shmem layout, hooks, slot allocators
+ *   3. PARSING            — executor hook, qual extraction
+ *   4. STRATEGIES         — decide_create_* family + dispatcher
+ *   5. INDEX MANAGEMENT   — bgworker, evaluate_and_manage_indexes, DDL
+ *   6. SQL-CALLABLE       — auto_index_reset, auto_index_stats SRF
+ */
+
+#include "postgres.h"
+
+#include <math.h>
+
+#include "access/xact.h"
+#include "executor/executor.h"
+#include "executor/spi.h"
+#include "fmgr.h"
+#include "miscadmin.h"
+#include "nodes/execnodes.h"
+#include "nodes/parsenodes.h"
+#include "nodes/plannodes.h"
+#include "nodes/primnodes.h"
+#include "postmaster/bgworker.h"
+#include "postmaster/interrupt.h"
+#include "storage/ipc.h"
+#include "storage/latch.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
+#include "optimizer/cost.h"
+#include "optimizer/optimizer.h"
+#include "nodes/pathnodes.h"
+#include "tcop/tcopprot.h"
+#include "utils/guc.h"
+#include "utils/builtins.h"
+#include "utils/lsyscache.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
+#include "utils/wait_event.h"
+#include "funcapi.h"
+
+#include "auto_index.h"
+
+PG_MODULE_MAGIC;
+
+
+/* ============================================================================
+ * 1. MODULE INIT & GUCs
+ * ============================================================================ */
+
+AutoIndexSharedState *auto_index_state = NULL;
+
+double	auto_index_threshold			 = 10.0;
+int		auto_index_check_interval		 = 300;
+int		auto_index_max_indexes_per_table = 6;
+
+typedef enum AutoIndexCreateStrategy
+{
+	AI_CREATE_SKI_RENTAL = 0,
+	AI_CREATE_SIMPLE_THRESHOLD,
+	AI_CREATE_RATIO_ONLY,
+	AI_CREATE_COST_GAIN,
+	AI_CREATE_SIZE_GATED,
+	AI_CREATE_ALWAYS,
+} AutoIndexCreateStrategy;
+
+int		auto_index_create_strategy	= AI_CREATE_SKI_RENTAL;
+double	auto_index_simple_threshold	= 100.0;	/* simple_threshold, size_gated */
+double	auto_index_min_table_rows	= 1000.0;	/* size_gated floor */
+
+static const struct config_enum_entry auto_index_create_strategy_options[] = {
+	{"ski_rental",		 AI_CREATE_SKI_RENTAL,		 false},
+	{"simple_threshold", AI_CREATE_SIMPLE_THRESHOLD, false},
+	{"ratio_only",		 AI_CREATE_RATIO_ONLY,		 false},
+	{"cost_gain",		 AI_CREATE_COST_GAIN,		 false},
+	{"size_gated",		 AI_CREATE_SIZE_GATED,		 false},
+	{"always",			 AI_CREATE_ALWAYS,			 false},
+	{NULL, 0, false},
+};
+
+/* Always chain hooks — never discard a previous handler. */
+static ExecutorEnd_hook_type	prev_ExecutorEnd	= NULL;
+static shmem_request_hook_type	prev_shmem_request	= NULL;
+static shmem_startup_hook_type	prev_shmem_startup	= NULL;
+
+static void auto_index_shmem_request(void);
+static void auto_index_shmem_startup(void);
+static void auto_index_executor_end(QueryDesc *queryDesc);
+static void walk_plan_state(PlanState *node);
+static void process_seqscan(SeqScanState *node);
+static int	find_table_slot(Oid relid);
+static int	find_col_slot(int tslot, AttrNumber attno);
+static int	find_colset_slot(int tslot, const AttrNumber *attnos,
+								 const int8 *ops, int n_cols);
+static void evaluate_and_manage_indexes(AutoIndexTableStats *snapshot);
+
+void _PG_init(void);
+
+void
+_PG_init(void)
+{
+	BackgroundWorker worker;
+
+	DefineCustomRealVariable(
+		"auto_index.threshold",
+		"Benefit/cost ratio above which an index is created.",
+		NULL,
+		&auto_index_threshold,
+		10.0, 1.0, 1000.0,
+		PGC_SIGHUP,
+		0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"auto_index.check_interval",
+		"Seconds between background worker evaluation passes.",
+		NULL,
+		&auto_index_check_interval,
+		300, 1, 3600,
+		PGC_SIGHUP,
+		0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"auto_index.max_indexes_per_table",
+		"Maximum number of auto-created indexes per table (singletons + composites combined).",
+		NULL,
+		&auto_index_max_indexes_per_table,
+		6, 1, 32,
+		PGC_SIGHUP,
+		0, NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"auto_index.create_strategy",
+		"Policy used to decide when to create an index.",
+		"ski_rental: cost-based ski rental (default).  "
+		"simple_threshold: fire on cumulative_benefit >= auto_index.simple_threshold.  "
+		"ratio_only: read/write ratio > auto_index.threshold.  "
+		"cost_gain: projected savings - maintenance >= build_cost.  "
+		"size_gated: simple_threshold gated by auto_index.min_table_rows.  "
+		"always: fire on any cumulative_benefit > 0 (max aggressiveness).",
+		&auto_index_create_strategy,
+		AI_CREATE_SKI_RENTAL,
+		auto_index_create_strategy_options,
+		PGC_SIGHUP,
+		0, NULL, NULL, NULL);
+
+	DefineCustomRealVariable(
+		"auto_index.simple_threshold",
+		"Cumulative weighted hits required by the simple_threshold and "
+		"size_gated create strategies.",
+		NULL,
+		&auto_index_simple_threshold,
+		100.0, 1.0, 1.0e12,
+		PGC_SIGHUP,
+		0, NULL, NULL, NULL);
+
+	DefineCustomRealVariable(
+		"auto_index.min_table_rows",
+		"Minimum reltuples for the size_gated create strategy to fire.",
+		NULL,
+		&auto_index_min_table_rows,
+		1000.0, 0.0, 1.0e12,
+		PGC_SIGHUP,
+		0, NULL, NULL, NULL);
+
+	MarkGUCPrefixReserved("auto_index");
+
+	prev_shmem_request	 = shmem_request_hook;
+	shmem_request_hook	 = auto_index_shmem_request;
+
+	prev_shmem_startup	 = shmem_startup_hook;
+	shmem_startup_hook	 = auto_index_shmem_startup;
+
+	prev_ExecutorEnd	 = ExecutorEnd_hook;
+	ExecutorEnd_hook	 = auto_index_executor_end;
+
+	memset(&worker, 0, sizeof(worker));
+	snprintf(worker.bgw_name,		   BGW_MAXLEN, "auto_index worker");
+	snprintf(worker.bgw_type,		   BGW_MAXLEN, "auto_index");
+	snprintf(worker.bgw_library_name,  MAXPGPATH,  "auto_index");
+	snprintf(worker.bgw_function_name, BGW_MAXLEN, "auto_index_main");
+	worker.bgw_flags		= BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time	= BgWorkerStart_RecoveryFinished;
+	worker.bgw_restart_time = 10;
+	RegisterBackgroundWorker(&worker);
+}
+
+
+/* ============================================================================
+ * 2. SHARED MEMORY
+ *
+ * Hook registration plus LRU slot allocators for tables, columns, and
+ * colsets.  All slot helpers must be called under LW_EXCLUSIVE.
+ * ============================================================================ */
+
+static void
+auto_index_shmem_request(void)
+{
+	if (prev_shmem_request)
+		prev_shmem_request();
+
+	RequestAddinShmemSpace(sizeof(AutoIndexSharedState));
+	RequestNamedLWLockTranche("auto_index", 1);
+}
+
+static void
+auto_index_shmem_startup(void)
+{
+	bool	found;
+
+	if (prev_shmem_startup)
+		prev_shmem_startup();
+
+	auto_index_state = ShmemInitStruct("auto_index",
+									   sizeof(AutoIndexSharedState),
+									   &found);
+	if (!found)
+	{
+		memset(auto_index_state, 0, sizeof(AutoIndexSharedState));
+		auto_index_state->lock = &GetNamedLWLockTranche("auto_index")[0].lock;
+	}
+}
+
+static int
+find_table_slot(Oid relid)
+{
+	int		i;
+	int		empty_slot = -1;
+	int		lru_slot   = -1;
+	uint64	lru_time   = UINT64_MAX;
+
+	for (i = 0; i < AUTO_INDEX_MAX_TABLES; i++)
+	{
+		AutoIndexTableStats *e = &auto_index_state->tables[i];
+
+		if (e->relation_id == relid)
+		{
+			e->last_access_tick = ++auto_index_state->access_counter;
+			return i;
+		}
+		if (e->relation_id == 0 && empty_slot == -1)
+			empty_slot = i;
+		if (e->last_access_tick < lru_time)
+		{
+			lru_time = e->last_access_tick;
+			lru_slot = i;
+		}
+	}
+
+	i = (empty_slot != -1) ? empty_slot : lru_slot;
+	memset(&auto_index_state->tables[i], 0, sizeof(AutoIndexTableStats));
+	auto_index_state->tables[i].relation_id		 = relid;
+	auto_index_state->tables[i].last_access_tick = ++auto_index_state->access_counter;
+	return i;
+}
+
+static int
+find_col_slot(int tslot, AttrNumber attno)
+{
+	int		i;
+	int		empty_slot = -1;
+
+	for (i = 0; i < AUTO_INDEX_MAX_COLS; i++)
+	{
+		AutoIndexColumnStats *c = &auto_index_state->tables[tslot].columns[i];
+
+		if (c->attribute_number == attno)
+			return i;
+		if (c->attribute_number == 0 && empty_slot == -1)
+			empty_slot = i;
+	}
+
+	if (empty_slot == -1)
+		return -1;					/* all slots full — drop this stat */
+
+	auto_index_state->tables[tslot].columns[empty_slot].attribute_number = attno;
+	return empty_slot;
+}
+
+/* attnos must be sorted ascending; ops aligned with attnos. */
+static int
+find_colset_slot(int tslot, const AttrNumber *attnos,
+				 const int8 *ops, int n_cols)
+{
+	AutoIndexColSet *slots = auto_index_state->tables[tslot].colsets;
+	int		i, j;
+	int		empty_slot = -1;
+	int		lru_slot = -1;
+	uint64	lru_time = UINT64_MAX;
+
+	for (i = 0; i < AUTO_INDEX_MAX_COLSETS; i++)
+	{
+		AutoIndexColSet *cs = &slots[i];
+
+		if (cs->n_cols == n_cols)
+		{
+			bool match = true;
+			for (j = 0; j < n_cols; j++)
+				if (cs->attnos[j] != attnos[j])
+				{
+					match = false;
+					break;
+				}
+			if (match)
+			{
+				cs->last_access_tick = ++auto_index_state->access_counter;
+				return i;
+			}
+		}
+		if (cs->n_cols == 0 && empty_slot == -1)
+			empty_slot = i;
+		if (cs->last_access_tick < lru_time)
+		{
+			lru_time = cs->last_access_tick;
+			lru_slot = i;
+		}
+	}
+
+	i = (empty_slot != -1) ? empty_slot : lru_slot;
+	if (i < 0)
+		return -1;
+
+	memset(&slots[i], 0, sizeof(AutoIndexColSet));
+	slots[i].n_cols = (int8) n_cols;
+	for (j = 0; j < n_cols; j++)
+	{
+		slots[i].attnos[j] = attnos[j];
+		slots[i].ops[j] = ops[j];
+	}
+	slots[i].last_access_tick = ++auto_index_state->access_counter;
+	return i;
+}
+
+
+/* ============================================================================
+ * 3. PARSING
+ *
+ * ExecutorEnd hook fires on every query.  walk_plan_state finds SeqScan
+ * nodes; process_seqscan extracts predicates from the qual tree into a
+ * local QualSet (recursing through BoolExpr, ScalarArrayOpExpr, OpExpr,
+ * peeling RelabelType casts), then under the lock bumps both the
+ * singleton hit counters and — if 2-3 distinct user-attrs were observed
+ * — the matching multi-column colset slot.
+ * ============================================================================ */
+
+#define LOCAL_PRED_MAX	16
+
+typedef struct LocalPred
+{
+	AttrNumber	attno;
+	int8		op;					/* 0 = equality, 1 = range */
+} LocalPred;
+
+typedef struct QualSet
+{
+	LocalPred	preds[LOCAL_PRED_MAX];
+	int			n_preds;
+} QualSet;
+
+/* Equality wins when the same column appears with both kinds of preds. */
+static void
+qualset_add(QualSet *qs, AttrNumber attno, int8 op)
+{
+	int		i;
+
+	if (!AttrNumberIsForUserDefinedAttr(attno))
+		return;
+
+	for (i = 0; i < qs->n_preds; i++)
+	{
+		if (qs->preds[i].attno == attno)
+		{
+			if (op == 0)
+				qs->preds[i].op = 0;
+			return;
+		}
+	}
+	if (qs->n_preds >= LOCAL_PRED_MAX)
+		return;
+	qs->preds[qs->n_preds].attno = attno;
+	qs->preds[qs->n_preds].op = op;
+	qs->n_preds++;
+}
+
+/* Peel implicit-cast wrappers (RelabelType from `col::text = 'x'` etc.). */
+static Expr *
+strip_implicit_casts(Expr *e)
+{
+	while (e != NULL && IsA(e, RelabelType))
+		e = ((RelabelType *) e)->arg;
+	return e;
+}
+
+static int8
+opname_to_op(const char *opname)
+{
+	if (strcmp(opname, "=") == 0)
+		return 0;
+	if (strcmp(opname, "<")  == 0 || strcmp(opname, ">")  == 0 ||
+		strcmp(opname, "<=") == 0 || strcmp(opname, ">=") == 0)
+		return 1;
+	return -1;
+}
+
+/* Recurses into BoolExpr so quals nested in OR/AND (TPC-H Q19) are seen. */
+static void
+process_qual_node(QualSet *qs, Expr *expr)
+{
+	if (expr == NULL)
+		return;
+
+	if (IsA(expr, BoolExpr))
+	{
+		BoolExpr   *b = (BoolExpr *) expr;
+		ListCell   *lc;
+
+		foreach(lc, b->args)
+			process_qual_node(qs, (Expr *) lfirst(lc));
+		return;
+	}
+
+	if (IsA(expr, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) expr;
+		Expr	   *arg;
+		char	   *opname;
+		int8		op;
+
+		if (list_length(saop->args) < 1)
+			return;
+		arg = strip_implicit_casts((Expr *) linitial(saop->args));
+		if (!IsA(arg, Var))
+			return;
+
+		opname = get_opname(saop->opno);
+		if (opname == NULL)
+			return;
+		op = opname_to_op(opname);
+		pfree(opname);
+		if (op < 0)
+			return;
+
+		qualset_add(qs, ((Var *) arg)->varattno, op);
+		return;
+	}
+
+	if (IsA(expr, OpExpr))
+	{
+		OpExpr	   *opx = (OpExpr *) expr;
+		Expr	   *left,
+				   *right;
+		AttrNumber	attno = InvalidAttrNumber;
+		char	   *opname;
+		int8		op;
+
+		if (list_length(opx->args) < 2)
+			return;					/* defensive: unary OpExpr */
+
+		left  = strip_implicit_casts((Expr *) linitial(opx->args));
+		right = strip_implicit_casts((Expr *) lsecond(opx->args));
+
+		if (IsA(left, Var) && IsA(right, Const))
+			attno = ((Var *) left)->varattno;
+		else if (IsA(left, Const) && IsA(right, Var))
+			attno = ((Var *) right)->varattno;
+		else
+			return;
+
+		opname = get_opname(opx->opno);
+		if (opname == NULL)
+			return;
+		op = opname_to_op(opname);
+		pfree(opname);
+		if (op < 0)
+			return;
+
+		qualset_add(qs, attno, op);
+	}
+
+	/* FuncExpr casts, NullTest, CaseExpr, SubPlan, ... — silently ignored. */
+}
+
+/* Insertion sort by attno (small N).  Result is the colset lookup key. */
+static void
+qualset_sort_by_attno(QualSet *qs)
+{
+	int		i, j;
+	for (i = 1; i < qs->n_preds; i++)
+	{
+		LocalPred key = qs->preds[i];
+		j = i - 1;
+		while (j >= 0 && qs->preds[j].attno > key.attno)
+		{
+			qs->preds[j + 1] = qs->preds[j];
+			j--;
+		}
+		qs->preds[j + 1] = key;
+	}
+}
+
+/* If we observed > AUTO_INDEX_COLSET_MAX_COLS attrs, keep the top N
+ * (equality preferred, then attno) so a colset entry is still bumped. */
+static void
+qualset_trim_to_max(QualSet *qs)
+{
+	int		i, j;
+	LocalPred picked[AUTO_INDEX_COLSET_MAX_COLS];
+	int		n_picked = 0;
+
+	if (qs->n_preds <= AUTO_INDEX_COLSET_MAX_COLS)
+		return;
+
+	for (i = 0; i < qs->n_preds && n_picked < AUTO_INDEX_COLSET_MAX_COLS; i++)
+		if (qs->preds[i].op == 0)
+			picked[n_picked++] = qs->preds[i];
+	for (i = 0; i < qs->n_preds && n_picked < AUTO_INDEX_COLSET_MAX_COLS; i++)
+		if (qs->preds[i].op == 1)
+			picked[n_picked++] = qs->preds[i];
+
+	for (i = 1; i < n_picked; i++)
+	{
+		LocalPred key = picked[i];
+		j = i - 1;
+		while (j >= 0 && picked[j].attno > key.attno)
+		{
+			picked[j + 1] = picked[j];
+			j--;
+		}
+		picked[j + 1] = key;
+	}
+
+	for (i = 0; i < n_picked; i++)
+		qs->preds[i] = picked[i];
+	qs->n_preds = n_picked;
+}
+
+static void
+process_seqscan(SeqScanState *node)
+{
+	Relation	rel;
+	Oid			relid;
+	int			tslot;
+	List	   *qual;
+	ListCell   *lc;
+	QualSet		qs;
+	int			i;
+
+	rel = node->ss.ss_currentRelation;
+	if (rel == NULL)
+		return;
+
+	relid = RelationGetRelid(rel);
+	if (!OidIsValid(relid))
+		return;
+
+	qual = node->ss.ps.plan->qual;
+	if (qual == NIL)
+		return;
+
+	/* Walk the qual tree without holding the lock. */
+	qs.n_preds = 0;
+	foreach(lc, qual)
+		process_qual_node(&qs, (Expr *) lfirst(lc));
+
+	if (qs.n_preds == 0)
+		return;
+
+	qualset_sort_by_attno(&qs);
+	qualset_trim_to_max(&qs);
+
+	LWLockAcquire(auto_index_state->lock, LW_EXCLUSIVE);
+
+	tslot = find_table_slot(relid);
+
+	for (i = 0; i < qs.n_preds; i++)
+	{
+		int		cslot = find_col_slot(tslot, qs.preds[i].attno);
+		if (cslot < 0)
+			continue;
+		if (qs.preds[i].op == 0)
+			auto_index_state->tables[tslot].columns[cslot].equality_hits++;
+		else
+			auto_index_state->tables[tslot].columns[cslot].range_hits++;
+	}
+
+	if (qs.n_preds >= 2 && qs.n_preds <= AUTO_INDEX_COLSET_MAX_COLS)
+	{
+		AttrNumber	attnos[AUTO_INDEX_COLSET_MAX_COLS];
+		int8		ops[AUTO_INDEX_COLSET_MAX_COLS];
+		int			cset;
+
+		for (i = 0; i < qs.n_preds; i++)
+		{
+			attnos[i] = qs.preds[i].attno;
+			ops[i] = qs.preds[i].op;
+		}
+		cset = find_colset_slot(tslot, attnos, ops, qs.n_preds);
+		if (cset >= 0)
+			auto_index_state->tables[tslot].colsets[cset].hits++;
+	}
+
+	LWLockRelease(auto_index_state->lock);
+}
+
+static void
+walk_plan_state(PlanState *node)
+{
+	ListCell   *lc;
+
+	if (node == NULL)
+		return;
+
+	if (IsA(node, SeqScanState))
+		process_seqscan((SeqScanState *) node);
+
+	walk_plan_state(node->lefttree);
+	walk_plan_state(node->righttree);
+
+	/* Correlated subqueries live in subPlan, not in the left/right trees. */
+	foreach(lc, node->subPlan)
+		walk_plan_state(((SubPlanState *) lfirst(lc))->planstate);
+}
+
+static void
+auto_index_executor_end(QueryDesc *queryDesc)
+{
+	if (auto_index_state != NULL &&
+		(queryDesc->operation == CMD_INSERT ||
+		 queryDesc->operation == CMD_UPDATE ||
+		 queryDesc->operation == CMD_DELETE))
+	{
+		PlannedStmt *pstmt = queryDesc->plannedstmt;
+
+		if (pstmt->resultRelationRelids != NULL)
+		{
+			int				rtindex = bms_next_member(pstmt->resultRelationRelids, -1);
+			RangeTblEntry  *rte = (rtindex > 0)
+				? (RangeTblEntry *) list_nth(pstmt->rtable, rtindex - 1)
+				: NULL;
+			Oid				relid = (rte != NULL) ? rte->relid : InvalidOid;
+
+			if (OidIsValid(relid))
+			{
+				int tslot;
+
+				LWLockAcquire(auto_index_state->lock, LW_EXCLUSIVE);
+				tslot = find_table_slot(relid);
+				if (queryDesc->operation == CMD_INSERT)
+					auto_index_state->tables[tslot].insert_count++;
+				else if (queryDesc->operation == CMD_UPDATE)
+					auto_index_state->tables[tslot].update_count++;
+				else
+					auto_index_state->tables[tslot].delete_count++;
+				LWLockRelease(auto_index_state->lock);
+			}
+		}
+	}
+
+	if (auto_index_state != NULL && queryDesc->planstate != NULL)
+		walk_plan_state(queryDesc->planstate);
+
+	if (prev_ExecutorEnd)
+		prev_ExecutorEnd(queryDesc);
+	else
+		standard_ExecutorEnd(queryDesc);
+}
+
+
+/* ============================================================================
+ * 4. STRATEGIES
+ *
+ * Pluggable predicates dispatched on auto_index.create_strategy.  Each
+ * decide_create_* takes the same CreateContext, returns true if the
+ * column (or, when invoked from the colset path, the synthetic column
+ * holding the colset's cumulative_benefit) qualifies for a new index.
+ * ============================================================================ */
+
+typedef struct CreateContext
+{
+	const AutoIndexColumnStats *col;
+	const AutoIndexTableStats  *tbl;
+	int64	create_threshold;	/* ski-rental "buy after N queries" */
+	double	seq_scan_cost;
+	double	build_cost;
+	double	maint_per_write;
+	double	reltuples;
+	double	relpages;
+} CreateContext;
+
+/* A: ski rental — cost-based, two checks (cumulative cost + read/write ratio). */
+static bool
+decide_create_ski_rental(const CreateContext *cc)
+{
+	double	cum_ratio;
+
+	if (cc->col->cumulative_benefit < cc->create_threshold)
+		return false;
+
+	cum_ratio = (double) cc->col->cumulative_benefit
+				/ Max(1, cc->tbl->cumulative_write_cost);
+	return cum_ratio > auto_index_threshold;
+}
+
+/* B: simple_threshold — fire on raw cumulative_benefit, no cost model. */
+static bool
+decide_create_simple_threshold(const CreateContext *cc)
+{
+	return cc->col->cumulative_benefit >= (int64) auto_index_simple_threshold;
+}
+
+/* C: ratio_only — read/write ratio above auto_index.threshold. */
+static bool
+decide_create_ratio_only(const CreateContext *cc)
+{
+	double	ratio;
+
+	if (cc->col->cumulative_benefit == 0)
+		return false;
+
+	ratio = (double) cc->col->cumulative_benefit
+			/ Max(1, cc->tbl->cumulative_write_cost);
+	return ratio > auto_index_threshold;
+}
+
+/* D: cost_gain — projected savings minus maintenance must pay off build_cost. */
+static bool
+decide_create_cost_gain(const CreateContext *cc)
+{
+	double	idx_lookup_cost;
+	double	savings_per_query;
+	double	total_savings;
+	double	total_maint;
+
+	if (cc->col->cumulative_benefit == 0)
+		return false;
+
+	/* B-tree descent + one heap fetch. */
+	idx_lookup_cost = log2(Max(2.0, cc->reltuples)) * 2.0 * cpu_operator_cost
+					  + random_page_cost;
+	savings_per_query = cc->seq_scan_cost - idx_lookup_cost;
+	if (savings_per_query <= 0)
+		return false;
+
+	total_savings = (double) cc->col->cumulative_benefit * savings_per_query;
+	total_maint   = (double) cc->tbl->cumulative_write_cost * cc->maint_per_write;
+
+	return (total_savings - total_maint) >= cc->build_cost;
+}
+
+/* E: size_gated — simple_threshold gated by a minimum table size. */
+static bool
+decide_create_size_gated(const CreateContext *cc)
+{
+	if (cc->reltuples < auto_index_min_table_rows)
+		return false;
+	return cc->col->cumulative_benefit >= (int64) auto_index_simple_threshold;
+}
+
+/* F: always — fire on any positive benefit (still subject to post-checks). */
+static bool
+decide_create_always(const CreateContext *cc)
+{
+	return cc->col->cumulative_benefit > 0;
+}
+
+static bool
+decide_create(const CreateContext *cc)
+{
+	switch (auto_index_create_strategy)
+	{
+		case AI_CREATE_SIMPLE_THRESHOLD: return decide_create_simple_threshold(cc);
+		case AI_CREATE_RATIO_ONLY:		 return decide_create_ratio_only(cc);
+		case AI_CREATE_COST_GAIN:		 return decide_create_cost_gain(cc);
+		case AI_CREATE_SIZE_GATED:		 return decide_create_size_gated(cc);
+		case AI_CREATE_ALWAYS:			 return decide_create_always(cc);
+		case AI_CREATE_SKI_RENTAL:
+		default:						 return decide_create_ski_rental(cc);
+	}
+}
+
+
+/* ============================================================================
+ * 5. INDEX MANAGEMENT
+ *
+ * Background worker auto_index_main wakes every check_interval, folds
+ * interval counters into cumulative state, snapshots the tables array,
+ * and hands the snapshot to evaluate_and_manage_indexes — which in
+ * Phase 1 picks composite + singleton CREATE candidates (with
+ * subsumption: a composite's leading column suppresses its singleton)
+ * and runs the ski-rental DROP accumulator, then in Phase 2 emits one
+ * CREATE/DROP INDEX per decision.
+ * ============================================================================ */
+
+#define MAX_DECISIONS 64
+
+typedef struct CreateDecision
+{
+	Oid			relid;
+	int			n_cols;								/* 1 = singleton, 2-3 = composite */
+	AttrNumber	attnos[AUTO_INDEX_COLSET_MAX_COLS];	/* ordered for CREATE INDEX */
+	char		schema[NAMEDATALEN];
+	char		relname[NAMEDATALEN];
+	char		attnames[AUTO_INDEX_COLSET_MAX_COLS][NAMEDATALEN];
+	char		idxname[NAMEDATALEN];
+} CreateDecision;
+
+typedef struct DropDecision
+{
+	Oid		indexrelid;
+	char	schema[NAMEDATALEN];
+	char	idxname[NAMEDATALEN];
+} DropDecision;
+
+/* Helpers below must run inside an active SPI connection. */
+
+static bool
+index_exists_for_column(Oid relid, AttrNumber attno)
+{
+	Oid		argtypes[2] = {OIDOID, INT2OID};
+	Datum	args[2]		= {ObjectIdGetDatum(relid), Int16GetDatum(attno)};
+	char	nulls[2]	= {' ', ' '};
+	int		ret;
+
+	ret = SPI_execute_with_args(
+		"SELECT 1 FROM pg_index "
+		"WHERE indrelid = $1 AND ($2::int2 = ANY(indkey)) AND indisvalid "
+		"LIMIT 1",
+		2, argtypes, args, nulls, true, 1);
+
+	return (ret == SPI_OK_SELECT && SPI_processed > 0);
+}
+
+static int
+count_auto_indexes(Oid relid)
+{
+	Oid		argtypes[1] = {OIDOID};
+	Datum	args[1]		= {ObjectIdGetDatum(relid)};
+	char	nulls[1]	= {' '};
+	int		ret;
+	bool	isnull;
+
+	/* Catalog table may not exist yet (CREATE EXTENSION not yet run). */
+	ret = SPI_execute(
+		"SELECT 1 FROM pg_tables "
+		"WHERE schemaname = 'public' AND tablename = 'auto_index_catalog' LIMIT 1",
+		true, 1);
+	if (ret != SPI_OK_SELECT || SPI_processed == 0)
+		return 0;
+
+	ret = SPI_execute_with_args(
+		"SELECT count(*)::int FROM auto_index_catalog WHERE relid = $1",
+		1, argtypes, args, nulls, true, 1);
+	if (ret != SPI_OK_SELECT || SPI_processed == 0)
+		return 0;
+
+	return DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+									   SPI_tuptable->tupdesc, 1, &isnull));
+}
+
+/*
+ * Reorder colset for actual CREATE INDEX: equality columns first (only
+ * way the planner can use later columns of a B-tree), range last,
+ * attno ascending within each group.  out arrays must hold cs->n_cols.
+ */
+static void
+reorder_colset_for_index(const AutoIndexColSet *cs,
+						 AttrNumber *out_attnos, int8 *out_ops)
+{
+	int		i, k = 0;
+
+	for (i = 0; i < cs->n_cols; i++)
+		if (cs->ops[i] == 0)
+		{
+			out_attnos[k] = cs->attnos[i];
+			out_ops[k] = 0;
+			k++;
+		}
+	for (i = 0; i < cs->n_cols; i++)
+		if (cs->ops[i] == 1)
+		{
+			out_attnos[k] = cs->attnos[i];
+			out_ops[k] = 1;
+			k++;
+		}
+}
+
+/*
+ * Subsumption: when a composite is queued, a singleton on its LEADING
+ * column is redundant (B-tree leftmost prefix serves "WHERE col = ?").
+ * Singletons on non-leading composite columns are NOT covered.
+ */
+static bool
+is_attno_covered_by_pending_composite(const CreateDecision *to_create,
+									  int n_create,
+									  Oid relid, AttrNumber attno)
+{
+	int		i;
+	for (i = 0; i < n_create; i++)
+	{
+		if (to_create[i].relid == relid &&
+			to_create[i].n_cols >= 2 &&
+			to_create[i].attnos[0] == attno)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Ski rental cost model (PostgreSQL planner units):
+ *   create_threshold = ceil(build_cost / seq_scan_cost)
+ *   drop_threshold   = build_cost * 1000
+ *   idle_accumulator += (writes * maint_per_write + seq_scan_cost) * 1000
+ * Scaling by 1000 keeps precision in the bigint catalog column.  The
+ * seq_scan_cost floor ensures even zero-write tables age out an unused
+ * index after roughly create_threshold idle intervals.
+ *
+ * Phase 1: gather decisions inside one regular transaction.
+ * Phase 2: one transaction per CREATE/DROP — CONCURRENTLY can't run in
+ *          any SPI context in a bgworker, so plain CREATE/DROP is used.
+ */
+static void
+evaluate_and_manage_indexes(AutoIndexTableStats *snapshot)
+{
+	CreateDecision	to_create[MAX_DECISIONS];
+	DropDecision	to_drop[MAX_DECISIONS];
+	int				n_create = 0,
+					n_drop   = 0;
+	int				i,
+					c;
+
+	/* ---------- Phase 1: gather decisions ---------- */
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	for (i = 0; i < AUTO_INDEX_MAX_TABLES && n_create + n_drop < MAX_DECISIONS; i++)
+	{
+		AutoIndexTableStats *t = &snapshot[i];
+		int		ret;
+
+		char   *schema = NULL;
+		char   *relname = NULL;
+		double	reltuples,
+				relpages;
+
+		int64	create_threshold;
+		int64	drop_threshold;
+		double	seq_scan_cost_val;
+		double	build_cost_val;
+		double	maint_per_write;
+
+		/* Read interval write count from the snapshot before it's stale. */
+		int64	interval_write_cost =
+			t->insert_count + t->update_count + t->delete_count;
+
+		if (!OidIsValid(t->relation_id))
+			continue;
+
+		/* Resolve table metadata. */
+		{
+			Oid		meta_argtypes[1] = {OIDOID};
+			Datum	meta_args[1]	 = {ObjectIdGetDatum(t->relation_id)};
+			char	meta_nulls[1]	 = {' '};
+			bool	isnull_meta;
+			int		ret_meta;
+
+			ret_meta = SPI_execute_with_args(
+				"SELECT n.nspname, c.relname, "
+				"       greatest(c.reltuples::float8, 2.0), "
+				"       greatest(c.relpages::float8,  1.0) "
+				"FROM pg_class c "
+				"JOIN pg_namespace n ON n.oid = c.relnamespace "
+				"WHERE c.oid = $1",
+				1, meta_argtypes, meta_args, meta_nulls, true, 1);
+
+			if (ret_meta != SPI_OK_SELECT || SPI_processed == 0)
+				continue;
+
+			schema    = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+			relname   = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+			reltuples = DatumGetFloat8(SPI_getbinval(SPI_tuptable->vals[0],
+								SPI_tuptable->tupdesc, 3, &isnull_meta));
+			relpages  = DatumGetFloat8(SPI_getbinval(SPI_tuptable->vals[0],
+								SPI_tuptable->tupdesc, 4, &isnull_meta));
+		}
+
+		/*
+		 * Use PostgreSQL's own cost_seqscan / cost_sort so we respect
+		 * tablespace and CPU cost GUCs.  cost_sort dominates B-tree
+		 * build cost (the executor sorts the heap then writes pages
+		 * in order) and uses maintenance_work_mem for sort buffers.
+		 */
+		{
+			RelOptInfo	rel_info;
+			PathTarget	tgt;
+			Path		seq_path;
+			Path		sort_path;
+
+			memset(&rel_info,  0, sizeof(rel_info));
+			memset(&tgt,	   0, sizeof(tgt));
+			memset(&seq_path,  0, sizeof(seq_path));
+			memset(&sort_path, 0, sizeof(sort_path));
+
+			rel_info.relid		   = 1;		/* > 0 to satisfy Assert */
+			rel_info.rtekind	   = RTE_RELATION;
+			rel_info.reltablespace = 0;
+			rel_info.pages		   = (BlockNumber) relpages;
+			rel_info.tuples		   = reltuples;
+			rel_info.rows		   = reltuples;
+			seq_path.pathtarget	   = &tgt;	/* cost_seqscan dereferences this */
+
+			cost_seqscan(&seq_path, NULL, &rel_info, NULL);
+			seq_scan_cost_val = seq_path.total_cost;
+
+			cost_sort(&sort_path, NULL,
+					  NIL, 0,
+					  seq_scan_cost_val, reltuples,
+					  8,					/* avg index entry width */
+					  2.0 * cpu_operator_cost,
+					  maintenance_work_mem,
+					  -1.0);
+			build_cost_val = sort_path.total_cost;
+
+			maint_per_write = cpu_index_tuple_cost + random_page_cost;
+		}
+
+		create_threshold = (int64) Max(2, ceil(build_cost_val /
+								Max(seq_scan_cost_val, 1.0)));
+		drop_threshold   = (int64) (build_cost_val * 1000.0);
+
+		/* ----- CREATE: composites first, then singletons ----- */
+		{
+			int		cs_idx;
+
+			/* Composite candidates. */
+			for (cs_idx = 0;
+				 cs_idx < AUTO_INDEX_MAX_COLSETS && n_create < MAX_DECISIONS;
+				 cs_idx++)
+			{
+				AutoIndexColSet	   *cs = &t->colsets[cs_idx];
+				AttrNumber			ord_attnos[AUTO_INDEX_COLSET_MAX_COLS];
+				int8				ord_ops[AUTO_INDEX_COLSET_MAX_COLS];
+				bool				skip = false;
+				int					ci;
+				CreateDecision	   *d;
+
+				if (cs->n_cols < 2)
+					continue;
+
+				/* ski_rental keeps its inline two-check form for parity;
+				 * other strategies wrap a synthetic ColumnStats. */
+				if (auto_index_create_strategy == AI_CREATE_SKI_RENTAL)
+				{
+					double	cum_ratio;
+					if (cs->cumulative_benefit < create_threshold)
+						continue;
+					cum_ratio = (double) cs->cumulative_benefit
+								/ Max(1, t->cumulative_write_cost);
+					if (cum_ratio <= auto_index_threshold)
+						continue;
+				}
+				else
+				{
+					AutoIndexColumnStats	syn;
+					CreateContext			cc;
+
+					memset(&syn, 0, sizeof(syn));
+					syn.attribute_number	= cs->attnos[0];
+					syn.cumulative_benefit	= cs->cumulative_benefit;
+
+					cc.col				= &syn;
+					cc.tbl				= t;
+					cc.create_threshold = create_threshold;
+					cc.seq_scan_cost	= seq_scan_cost_val;
+					cc.build_cost		= build_cost_val;
+					cc.maint_per_write	= maint_per_write;
+					cc.reltuples		= reltuples;
+					cc.relpages			= relpages;
+
+					if (!decide_create(&cc))
+						continue;
+				}
+
+				if (count_auto_indexes(t->relation_id) >=
+					auto_index_max_indexes_per_table)
+					break;
+
+				reorder_colset_for_index(cs, ord_attnos, ord_ops);
+
+				d = &to_create[n_create];
+				d->relid	= t->relation_id;
+				d->n_cols	= cs->n_cols;
+				for (ci = 0; ci < cs->n_cols; ci++)
+					d->attnos[ci] = ord_attnos[ci];
+				strlcpy(d->schema,	schema,		NAMEDATALEN);
+				strlcpy(d->relname, relname,	NAMEDATALEN);
+
+				/* Resolve column names; abandon composite if any miss. */
+				for (ci = 0; ci < cs->n_cols; ci++)
+				{
+					Oid		argtypes[2] = {OIDOID, INT2OID};
+					Datum	args[2]		= {ObjectIdGetDatum(t->relation_id),
+										   Int16GetDatum(d->attnos[ci])};
+					char	nulls[2]	= {' ', ' '};
+					int		ret2;
+					char   *attname;
+
+					ret2 = SPI_execute_with_args(
+						"SELECT attname FROM pg_attribute "
+						"WHERE attrelid = $1 AND attnum = $2 AND NOT attisdropped",
+						2, argtypes, args, nulls, true, 1);
+					if (ret2 != SPI_OK_SELECT || SPI_processed == 0)
+					{
+						skip = true;
+						break;
+					}
+					attname = SPI_getvalue(SPI_tuptable->vals[0],
+										   SPI_tuptable->tupdesc, 1);
+					strlcpy(d->attnames[ci], attname, NAMEDATALEN);
+				}
+				if (skip)
+					continue;
+
+				if (cs->n_cols == 2)
+					snprintf(d->idxname, NAMEDATALEN,
+							 "auto_idx_m_%u_%d_%d",
+							 t->relation_id, d->attnos[0], d->attnos[1]);
+				else
+					snprintf(d->idxname, NAMEDATALEN,
+							 "auto_idx_m_%u_%d_%d_%d",
+							 t->relation_id, d->attnos[0], d->attnos[1], d->attnos[2]);
+
+				n_create++;
+			}
+
+			/* Singleton candidates. */
+			for (c = 0; c < AUTO_INDEX_MAX_COLS && n_create < MAX_DECISIONS; c++)
+			{
+				AutoIndexColumnStats   *col = &t->columns[c];
+				double					cum_ratio;
+				int						ret2;
+
+				if (!AttrNumberIsForUserDefinedAttr(col->attribute_number))
+					continue;
+
+				/* Subsumption — composite covers this column's queries. */
+				if (is_attno_covered_by_pending_composite(
+						to_create, n_create,
+						t->relation_id, col->attribute_number))
+					continue;
+
+				if (auto_index_create_strategy == AI_CREATE_SKI_RENTAL)
+				{
+					if (col->cumulative_benefit < create_threshold)
+						continue;
+					cum_ratio = (double) col->cumulative_benefit
+								/ Max(1, t->cumulative_write_cost);
+					if (cum_ratio <= auto_index_threshold)
+						continue;
+				}
+				else
+				{
+					CreateContext cc;
+
+					cc.col				= col;
+					cc.tbl				= t;
+					cc.create_threshold = create_threshold;
+					cc.seq_scan_cost	= seq_scan_cost_val;
+					cc.build_cost		= build_cost_val;
+					cc.maint_per_write	= maint_per_write;
+					cc.reltuples		= reltuples;
+					cc.relpages			= relpages;
+
+					if (!decide_create(&cc))
+						continue;
+				}
+
+				if (index_exists_for_column(t->relation_id, col->attribute_number))
+					continue;
+				if (count_auto_indexes(t->relation_id) >=
+					auto_index_max_indexes_per_table)
+					continue;
+
+				{
+					Oid		col_argtypes[2] = {OIDOID, INT2OID};
+					Datum	col_args[2]		= {ObjectIdGetDatum(t->relation_id),
+											   Int16GetDatum(col->attribute_number)};
+					char	col_nulls[2]	= {' ', ' '};
+					char   *attname;
+					CreateDecision *d = &to_create[n_create];
+
+					ret2 = SPI_execute_with_args(
+						"SELECT attname FROM pg_attribute "
+						"WHERE attrelid = $1 AND attnum = $2 AND NOT attisdropped",
+						2, col_argtypes, col_args, col_nulls, true, 1);
+					if (ret2 != SPI_OK_SELECT || SPI_processed == 0)
+						continue;
+
+					attname = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+
+					d->relid	 = t->relation_id;
+					d->n_cols	 = 1;
+					d->attnos[0] = col->attribute_number;
+					strlcpy(d->schema,		schema,  NAMEDATALEN);
+					strlcpy(d->relname,		relname, NAMEDATALEN);
+					strlcpy(d->attnames[0], attname, NAMEDATALEN);
+					snprintf(d->idxname, NAMEDATALEN, "auto_idx_%u_%d",
+							 t->relation_id, col->attribute_number);
+					n_create++;
+				}
+			}
+		}
+
+		/* ----- DROP candidates: ski-rental on idle maintenance cost ----- */
+		{
+			Oid		argtypes[1] = {OIDOID};
+			Datum	args[1]		= {ObjectIdGetDatum(t->relation_id)};
+			char	nulls[1]	= {' '};
+
+			ret = SPI_execute(
+				"SELECT 1 FROM pg_tables "
+				"WHERE schemaname = 'public' AND tablename = 'auto_index_catalog' LIMIT 1",
+				true, 1);
+			if (ret != SPI_OK_SELECT || SPI_processed == 0)
+				continue;
+
+			ret = SPI_execute_with_args(
+				"SELECT a.indexrelid, a.last_checked_idx_scan, a.idle_write_cost, "
+				"       n.nspname, c.relname "
+				"FROM auto_index_catalog a "
+				"JOIN pg_class c ON c.oid = a.indexrelid "
+				"JOIN pg_namespace n ON n.oid = c.relnamespace "
+				"WHERE a.relid = $1",
+				1, argtypes, args, nulls, true, 0);
+
+			if (ret == SPI_OK_SELECT)
+			{
+				uint64	nrows = SPI_processed;
+				SPITupleTable *tbl = SPI_tuptable;
+
+				for (uint64 r = 0; r < nrows && n_drop < MAX_DECISIONS; r++)
+				{
+					Oid		indexrelid;
+					int64	last_scan, cur_scan, idle_cost, new_idle;
+					char   *idx_schema, *idxname;
+					bool	isnull2;
+					int		ret3;
+					Oid		scan_argtypes[1] = {OIDOID};
+					Datum	scan_args[1];
+					char	scan_nulls[1]	 = {' '};
+
+					indexrelid = DatumGetObjectId(
+						SPI_getbinval(tbl->vals[r], tbl->tupdesc, 1, &isnull2));
+					last_scan  = DatumGetInt64(
+						SPI_getbinval(tbl->vals[r], tbl->tupdesc, 2, &isnull2));
+					idle_cost  = DatumGetInt64(
+						SPI_getbinval(tbl->vals[r], tbl->tupdesc, 3, &isnull2));
+					idx_schema = SPI_getvalue(tbl->vals[r], tbl->tupdesc, 4);
+					idxname    = SPI_getvalue(tbl->vals[r], tbl->tupdesc, 5);
+
+					scan_args[0] = ObjectIdGetDatum(indexrelid);
+					ret3 = SPI_execute_with_args(
+						"SELECT idx_scan FROM pg_stat_user_indexes "
+						"WHERE indexrelid = $1",
+						1, scan_argtypes, scan_args, scan_nulls, true, 1);
+					if (ret3 != SPI_OK_SELECT || SPI_processed == 0)
+						continue;
+
+					cur_scan = DatumGetInt64(
+						SPI_getbinval(SPI_tuptable->vals[0],
+									  SPI_tuptable->tupdesc, 1, &isnull2));
+
+					if (last_scan == -1)
+					{
+						/* Sentinel: first eval after creation.  Just record the
+						 * baseline scan count; don't accumulate idle cost yet. */
+						Oid		upd_t[2]  = {INT8OID, OIDOID};
+						Datum	upd_a[2]  = {Int64GetDatum(cur_scan),
+											 ObjectIdGetDatum(indexrelid)};
+						char	upd_n[2]  = {' ', ' '};
+
+						SPI_execute_with_args(
+							"UPDATE auto_index_catalog "
+							"SET last_checked_idx_scan = $1, "
+							"    last_checked_at = now(), "
+							"    idle_write_cost = 0 "
+							"WHERE indexrelid = $2",
+							2, upd_t, upd_a, upd_n, false, 0);
+						continue;
+					}
+
+					if (cur_scan > last_scan)
+					{
+						/* Index was used — reset the idle clock. */
+						Oid		upd_t[2]  = {INT8OID, OIDOID};
+						Datum	upd_a[2]  = {Int64GetDatum(cur_scan),
+											 ObjectIdGetDatum(indexrelid)};
+						char	upd_n[2]  = {' ', ' '};
+
+						SPI_execute_with_args(
+							"UPDATE auto_index_catalog "
+							"SET last_checked_idx_scan = $1, "
+							"    last_checked_at = now(), "
+							"    idle_write_cost = 0 "
+							"WHERE indexrelid = $2",
+							2, upd_t, upd_a, upd_n, false, 0);
+					}
+					else
+					{
+						/* Idle interval — accumulate maintenance cost. */
+						double	contribution =
+							(interval_write_cost * maint_per_write
+							 + seq_scan_cost_val) * 1000.0;
+
+						new_idle = idle_cost + (int64) contribution;
+
+						{
+							Oid		upd_t[3]  = {INT8OID, OIDOID, INT8OID};
+							Datum	upd_a[3]  = {Int64GetDatum(cur_scan),
+												 ObjectIdGetDatum(indexrelid),
+												 Int64GetDatum(new_idle)};
+							char	upd_n[3]  = {' ', ' ', ' '};
+
+							SPI_execute_with_args(
+								"UPDATE auto_index_catalog "
+								"SET last_checked_idx_scan = $1, "
+								"    last_checked_at = now(), "
+								"    idle_write_cost = $3 "
+								"WHERE indexrelid = $2",
+								3, upd_t, upd_a, upd_n, false, 0);
+						}
+
+						if (new_idle >= drop_threshold && n_drop < MAX_DECISIONS)
+						{
+							DropDecision *d = &to_drop[n_drop];
+
+							d->indexrelid = indexrelid;
+							strlcpy(d->schema,  idx_schema, NAMEDATALEN);
+							strlcpy(d->idxname, idxname,    NAMEDATALEN);
+							n_drop++;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	PopActiveSnapshot();
+	SPI_finish();
+	CommitTransactionCommand();
+
+	/* ---------- Phase 2: emit DDL ---------- */
+	if (n_create == 0 && n_drop == 0)
+		return;
+
+	for (i = 0; i < n_create; i++)
+	{
+		CreateDecision *d = &to_create[i];
+		char	sql[1024];
+		char	collist[NAMEDATALEN * AUTO_INDEX_COLSET_MAX_COLS + 16];
+		char	attnos_literal[64];
+		int		k;
+
+		/* "col1, col2, col3" for the CREATE INDEX column list. */
+		{
+			int written = 0;
+			for (k = 0; k < d->n_cols; k++)
+				written += snprintf(collist + written,
+									sizeof(collist) - written,
+									"%s%s",
+									(k == 0 ? "" : ", "),
+									d->attnames[k]);
+		}
+
+		/* "ARRAY[a, b, c]::smallint[]" for the catalog INSERT. */
+		{
+			int written = snprintf(attnos_literal, sizeof(attnos_literal),
+								   "ARRAY[%d", d->attnos[0]);
+			for (k = 1; k < d->n_cols; k++)
+				written += snprintf(attnos_literal + written,
+									sizeof(attnos_literal) - written,
+									", %d", d->attnos[k]);
+			snprintf(attnos_literal + written,
+					 sizeof(attnos_literal) - written,
+					 "]::smallint[]");
+		}
+
+		snprintf(sql, sizeof(sql),
+				 "CREATE INDEX IF NOT EXISTS %s ON %s.%s (%s)",
+				 d->idxname, d->schema, d->relname, collist);
+
+		PG_TRY();
+		{
+			SetCurrentStatementStartTimestamp();
+			StartTransactionCommand();
+			SPI_connect();
+			PushActiveSnapshot(GetTransactionSnapshot());
+
+			SPI_execute(sql, false, 0);
+
+			/* INSERT...SELECT finds the OID of the index we just created
+			 * (visible in pg_class within the same transaction).  attnos
+			 * literal is interpolated into the SQL text — small ints from
+			 * internal source, no injection risk; SPI_execute_with_args
+			 * has no convenient way to bind an array literal. */
+			{
+				char	insert_sql[768];
+				Oid		argtypes[2] = {OIDOID, NAMEOID};
+				Datum	args[2]		= {ObjectIdGetDatum(d->relid),
+									   DirectFunctionCall1(namein,
+										   CStringGetDatum(d->idxname))};
+				char	nulls[2]	= {' ', ' '};
+
+				snprintf(insert_sql, sizeof(insert_sql),
+					"INSERT INTO auto_index_catalog "
+					"    (relid, indexrelid, attnos, created_at, last_checked_idx_scan) "
+					"SELECT $1, c.oid, %s, now(), -1 "
+					"FROM   pg_class c "
+					"JOIN   pg_namespace n ON n.oid = c.relnamespace "
+					"WHERE  c.relname = $2 AND n.nspname = 'public' "
+					"ON CONFLICT DO NOTHING",
+					attnos_literal);
+
+				/* -1 baseline: first DROP eval sees cur_scan(0) != -1 and
+				 * skips drop, so a fresh index gets one full idle interval. */
+				SPI_execute_with_args(insert_sql,
+									  2, argtypes, args, nulls, false, 0);
+			}
+
+			PopActiveSnapshot();
+			SPI_finish();
+			CommitTransactionCommand();
+
+			/*
+			 * Reset cumulative_benefit so this column / colset doesn't
+			 * immediately re-qualify next pass.  For composites we reset
+			 * the matching colset slot (any-order match) AND the leading
+			 * column's singleton (composite serves it via leftmost prefix).
+			 */
+			{
+				int si, ci, csi, m;
+
+				LWLockAcquire(auto_index_state->lock, LW_EXCLUSIVE);
+				for (si = 0; si < AUTO_INDEX_MAX_TABLES; si++)
+				{
+					AutoIndexTableStats *t;
+
+					if (auto_index_state->tables[si].relation_id != d->relid)
+						continue;
+					t = &auto_index_state->tables[si];
+
+					if (d->n_cols == 1)
+					{
+						for (ci = 0; ci < AUTO_INDEX_MAX_COLS; ci++)
+							if (t->columns[ci].attribute_number == d->attnos[0])
+							{
+								t->columns[ci].cumulative_benefit = 0;
+								break;
+							}
+					}
+					else
+					{
+						for (csi = 0; csi < AUTO_INDEX_MAX_COLSETS; csi++)
+						{
+							AutoIndexColSet *cs = &t->colsets[csi];
+							bool match;
+
+							if (cs->n_cols != d->n_cols)
+								continue;
+							match = true;
+							for (m = 0; m < d->n_cols && match; m++)
+							{
+								int n;
+								bool found = false;
+								for (n = 0; n < cs->n_cols; n++)
+									if (cs->attnos[n] == d->attnos[m])
+									{
+										found = true;
+										break;
+									}
+								if (!found)
+									match = false;
+							}
+							if (match)
+								cs->cumulative_benefit = 0;
+						}
+						for (ci = 0; ci < AUTO_INDEX_MAX_COLS; ci++)
+							if (t->columns[ci].attribute_number == d->attnos[0])
+							{
+								t->columns[ci].cumulative_benefit = 0;
+								break;
+							}
+					}
+					break;
+				}
+				LWLockRelease(auto_index_state->lock);
+			}
+
+			elog(LOG, "auto_index: created %s index %s on %s.%s (%s)",
+				 (d->n_cols == 1 ? "single-col" : "composite"),
+				 d->idxname, d->schema, d->relname, collist);
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+			MemoryContext oldctx = MemoryContextSwitchTo(TopMemoryContext);
+
+			edata = CopyErrorData();
+			MemoryContextSwitchTo(oldctx);
+			elog(WARNING, "auto_index: failed to create index %s: %s",
+				 d->idxname, edata->message);
+			FreeErrorData(edata);
+			FlushErrorState();
+			AbortCurrentTransaction();
+		}
+		PG_END_TRY();
+	}
+
+	for (i = 0; i < n_drop; i++)
+	{
+		DropDecision *d = &to_drop[i];
+		char	sql[512];
+
+		snprintf(sql, sizeof(sql),
+				 "DROP INDEX IF EXISTS %s.%s",
+				 d->schema, d->idxname);
+
+		PG_TRY();
+		{
+			SetCurrentStatementStartTimestamp();
+			StartTransactionCommand();
+			SPI_connect();
+			PushActiveSnapshot(GetTransactionSnapshot());
+
+			SPI_execute(sql, false, 0);
+
+			{
+				Oid		argtypes[1] = {OIDOID};
+				Datum	args[1]		= {ObjectIdGetDatum(d->indexrelid)};
+				char	nulls[1]	= {' '};
+
+				SPI_execute_with_args(
+					"DELETE FROM auto_index_catalog WHERE indexrelid = $1",
+					1, argtypes, args, nulls, false, 0);
+			}
+
+			PopActiveSnapshot();
+			SPI_finish();
+			CommitTransactionCommand();
+
+			elog(LOG, "auto_index: dropped index %s.%s",
+				 d->schema, d->idxname);
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+			MemoryContext oldctx = MemoryContextSwitchTo(TopMemoryContext);
+
+			edata = CopyErrorData();
+			MemoryContextSwitchTo(oldctx);
+			elog(WARNING, "auto_index: failed to drop index %s: %s",
+				 d->idxname, edata->message);
+			FreeErrorData(edata);
+			FlushErrorState();
+			AbortCurrentTransaction();
+		}
+		PG_END_TRY();
+	}
+}
+
+/*
+ * Background worker entry point.
+ *
+ * Each iteration:
+ *   1. Wait for check_interval seconds (or latch / postmaster death).
+ *   2. Acquire the lock and:
+ *        Phase A — fold interval counters into cumulative state.
+ *        Phase B — copy the tables array into a local snapshot.
+ *        Phase C — zero interval counters.
+ *      Order matters: snapshot must reflect THIS interval's hits (Phase A
+ *      before B), but evaluate also reads interval_write_cost so we
+ *      defer zeroing until after the snapshot (B before C).
+ *   3. Release lock and call evaluate_and_manage_indexes(snapshot).
+ */
+PGDLLEXPORT void
+auto_index_main(Datum main_arg)
+{
+	BackgroundWorkerInitializeConnection("postgres", NULL, 0);
+	BackgroundWorkerUnblockSignals();
+
+	elog(LOG, "auto_index worker started");
+
+	while (true)
+	{
+		AutoIndexTableStats *snapshot;
+		int					 rc;
+
+		rc = WaitLatch(MyLatch,
+					   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					   auto_index_check_interval * 1000L,
+					   PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+
+		if (rc & WL_EXIT_ON_PM_DEATH)
+			break;
+
+		CHECK_FOR_INTERRUPTS();
+
+		snapshot = palloc(sizeof(auto_index_state->tables));
+		{
+			int		si,
+					ci;
+
+			LWLockAcquire(auto_index_state->lock, LW_EXCLUSIVE);
+
+			/* Phase A: fold interval -> cumulative. */
+			for (si = 0; si < AUTO_INDEX_MAX_TABLES; si++)
+			{
+				AutoIndexTableStats *t = &auto_index_state->tables[si];
+				int		csi;
+
+				t->cumulative_write_cost +=
+					t->insert_count + t->update_count + t->delete_count;
+				for (ci = 0; ci < AUTO_INDEX_MAX_COLS; ci++)
+					t->columns[ci].cumulative_benefit +=
+						t->columns[ci].equality_hits * 2 + t->columns[ci].range_hits;
+				for (csi = 0; csi < AUTO_INDEX_MAX_COLSETS; csi++)
+				{
+					/* Composite weight = n_cols × hits — biases the
+					 * decision toward composites that the planner can
+					 * actually exploit (each hit reflects N columns
+					 * appearing together). */
+					AutoIndexColSet *cs = &t->colsets[csi];
+					if (cs->n_cols == 0)
+						continue;
+					cs->cumulative_benefit += cs->hits * cs->n_cols;
+				}
+			}
+
+			/* Phase B: snapshot. */
+			memcpy(snapshot, auto_index_state->tables, sizeof(auto_index_state->tables));
+
+			/* Phase C: zero interval counters. */
+			for (si = 0; si < AUTO_INDEX_MAX_TABLES; si++)
+			{
+				AutoIndexTableStats *t = &auto_index_state->tables[si];
+				int		csi;
+
+				t->insert_count = 0;
+				t->update_count = 0;
+				t->delete_count = 0;
+				for (ci = 0; ci < AUTO_INDEX_MAX_COLS; ci++)
+				{
+					t->columns[ci].equality_hits = 0;
+					t->columns[ci].range_hits    = 0;
+				}
+				for (csi = 0; csi < AUTO_INDEX_MAX_COLSETS; csi++)
+					t->colsets[csi].hits = 0;
+			}
+
+			LWLockRelease(auto_index_state->lock);
+		}
+
+		PG_TRY();
+		{
+			evaluate_and_manage_indexes(snapshot);
+		}
+		PG_CATCH();
+		{
+			elog(WARNING, "auto_index: evaluation pass failed: %m");
+			FlushErrorState();
+		}
+		PG_END_TRY();
+
+		pfree(snapshot);
+	}
+}
+
+
+/* ============================================================================
+ * 6. SQL-CALLABLE FUNCTIONS
+ * ============================================================================ */
+
+PG_FUNCTION_INFO_V1(auto_index_reset);
+Datum
+auto_index_reset(PG_FUNCTION_ARGS)
+{
+	if (auto_index_state == NULL)
+		ereport(ERROR,
+				(errmsg("auto_index shared memory not initialised — "
+						"is auto_index in shared_preload_libraries?")));
+
+	LWLockAcquire(auto_index_state->lock, LW_EXCLUSIVE);
+	memset(auto_index_state->tables, 0,
+		   sizeof(auto_index_state->tables));
+	auto_index_state->access_counter = 0;
+	auto_index_state->generation++;
+	LWLockRelease(auto_index_state->lock);
+
+	PG_RETURN_VOID();
+}
+
+/* SRF returning one row per tracked (table, column) pair with hits > 0. */
+
+typedef struct StatsScanState
+{
+	AutoIndexTableStats tables[AUTO_INDEX_MAX_TABLES];
+	int		tslot;
+	int		cslot;
+} StatsScanState;
+
+PG_FUNCTION_INFO_V1(auto_index_stats);
+Datum
+auto_index_stats(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	StatsScanState  *scan;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		MemoryContext oldctx;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldctx  = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		if (auto_index_state == NULL)
+			ereport(ERROR,
+					(errmsg("auto_index shared memory not initialised — "
+							"is auto_index in shared_preload_libraries?")));
+
+		scan = palloc(sizeof(StatsScanState));
+		LWLockAcquire(auto_index_state->lock, LW_SHARED);
+		memcpy(scan->tables, auto_index_state->tables,
+			   sizeof(scan->tables));
+		LWLockRelease(auto_index_state->lock);
+		scan->tslot = 0;
+		scan->cslot = 0;
+
+		funcctx->user_fctx = scan;
+
+		{
+			TupleDesc tupdesc;
+
+			if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+				ereport(ERROR,
+						(errmsg("auto_index_stats: return type must be composite")));
+			funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+		}
+
+		MemoryContextSwitchTo(oldctx);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	scan    = (StatsScanState *) funcctx->user_fctx;
+
+	while (scan->tslot < AUTO_INDEX_MAX_TABLES)
+	{
+		AutoIndexTableStats  *t = &scan->tables[scan->tslot];
+		AutoIndexColumnStats *c;
+
+		if (!OidIsValid(t->relation_id))
+		{
+			scan->tslot++;
+			scan->cslot = 0;
+			continue;
+		}
+
+		if (scan->cslot >= AUTO_INDEX_MAX_COLS)
+		{
+			scan->tslot++;
+			scan->cslot = 0;
+			continue;
+		}
+
+		c = &t->columns[scan->cslot];
+		scan->cslot++;
+
+		if (!AttrNumberIsForUserDefinedAttr(c->attribute_number))
+			continue;
+		if (c->equality_hits == 0 && c->range_hits == 0)
+			continue;
+
+		{
+			Datum		values[4];
+			bool		nulls[4] = {false, false, false, false};
+			HeapTuple	tuple;
+
+			values[0] = ObjectIdGetDatum(t->relation_id);
+			values[1] = Int16GetDatum(c->attribute_number);
+			values[2] = Int64GetDatum(c->equality_hits);
+			values[3] = Int64GetDatum(c->range_hits);
+
+			tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+			SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+		}
+	}
+
+	SRF_RETURN_DONE(funcctx);
+}

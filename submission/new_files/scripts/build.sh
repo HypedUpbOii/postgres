@@ -1,0 +1,62 @@
+#!/bin/bash
+#
+# Build / clean PostgreSQL + the auto_index extension.
+#
+# Usage: scripts/build.sh <command>
+#
+#   docker    Bring up the docker container (idempotent).
+#   pg        Build and install PostgreSQL inside the container.
+#   init      Initialise the data dir + start the server (first time only).
+#   ext       Rebuild and reload the auto_index extension (fast iteration).
+#   clean     Drop test tables + reset auto_index state in the running DB.
+#   all       docker + pg + init + ext  (full setup from scratch).
+#
+# Examples:
+#   scripts/build.sh all              # full setup from scratch
+#   scripts/build.sh ext              # rebuild after editing C code
+#   scripts/build.sh clean            # wipe demo/benchmark state
+#
+set -e
+
+CMD="${1:-help}"
+CONTAINER="pg-dev"
+LIB="/postgres/scripts/lib"
+
+case "$CMD" in
+    help|"")
+        sed -n '3,17p' "$0"
+        ;;
+    docker)
+        echo "[*] Bringing up Docker container..."
+        docker compose up -d --build
+        ;;
+    pg)
+        echo "[*] Building PostgreSQL inside container..."
+        docker compose exec "$CONTAINER" bash "$LIB/pg_build.sh"
+        ;;
+    init)
+        echo "[*] Initialising data dir + starting server..."
+        docker compose exec "$CONTAINER" bash "$LIB/pg_init.sh"
+        ;;
+    ext)
+        echo "[*] Rebuilding auto_index extension..."
+        docker compose exec "$CONTAINER" bash "$LIB/ext_build.sh"
+        ;;
+    clean)
+        echo "[*] Cleaning auto_index state + test tables..."
+        docker compose exec "$CONTAINER" bash "$LIB/clean.sh"
+        ;;
+    all)
+        "$0" docker
+        "$0" pg
+        "$0" init
+        "$0" ext
+        echo ""
+        echo "✓ Full build complete.  Try:  scripts/run.sh psql"
+        ;;
+    *)
+        echo "Unknown command: $CMD" >&2
+        echo "Run '$0 help' for usage." >&2
+        exit 1
+        ;;
+esac

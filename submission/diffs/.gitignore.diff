@@ -1,0 +1,29 @@
+diff --git a/.gitignore b/.gitignore
+index 4e911395fe..fc4689e568 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -31,6 +31,7 @@ win32ver.rc
+ *.exe
+ lib*dll.def
+ lib*.pc
++logfile
+ 
+ # Local excludes in root directory
+ /GNUmakefile
+@@ -43,3 +44,16 @@ lib*.pc
+ /Release/
+ /tmp_install/
+ /portlock/
++/data/
++
++# auto_index-project local artifacts (see scripts/lib/tpch_setup.sh).
++# tpch/ holds the cloned tpch-dbgen tool plus any generated SF=*.tbl
++# data — regenerated on demand, no reason to track it.
++/scripts/lib/tpch/
++/.codex
++
++# LaTeX build artifacts for report/report.tex (keep .tex and .pdf).
++/report/*.aux
++/report/*.log
++/report/*.out
++/report/*.toc

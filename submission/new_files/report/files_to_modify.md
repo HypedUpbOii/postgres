@@ -1,0 +1,62 @@
+# Files to Modify
+
+No PostgreSQL source files (.c or .h under src/) need to be modified.
+The extension relies entirely on existing public hook APIs and shared memory APIs.
+
+---
+
+## Configuration / Non-source Changes
+
+### `postgresql.conf` (generated at `initdb` time, not a source file)
+
+Add this line to load the extension at server startup so hooks and shared memory are
+registered before any backends fork:
+
+```
+shared_preload_libraries = 'auto_index'
+```
+
+Optional tuning knobs exposed as GUCs (set here or via `ALTER SYSTEM`):
+
+```
+auto_index.threshold = 10.0        # benefit/cost ratio above which an index is created
+auto_index.check_interval = 300    # seconds between bgworker evaluation passes
+auto_index.max_indexes_per_table = 3
+auto_index.max_tracked_tables = 256
+auto_index.max_columns_per_table = 16
+```
+
+**Important:** `max_tracked_tables` and `max_columns_per_table` determine the shared
+memory allocation and are read before any config reload can fire. Changing them requires
+a full server restart, the same as `shared_buffers` or `max_connections`. All other
+GUCs can be changed with `ALTER SYSTEM` + `pg_reload_conf()` without a restart.
+
+### SQL (run once per database after server starts)
+
+```sql
+CREATE EXTENSION auto_index;
+```
+
+This installs the `auto_index_catalog` table and monitoring functions into the target
+database. The shared memory segment and background worker are server-wide (registered
+in `_PG_init`), but the catalog table is per-database. The background worker must
+connect to a specific database via `BackgroundWorkerInitializeConnection()` — it cannot
+see catalog tables in other databases without reconnecting.
+
+---
+
+## Why No Source Modifications Are Needed
+
+All required extension points are already exported by the core:
+
+| Need                          | Hook / API                        | Header                         |
+|-------------------------------|-----------------------------------|--------------------------------|
+| Intercept query completion    | `ExecutorEnd_hook`                | `executor/executor.h`          |
+| Intercept DML writes          | `ProcessUtility_hook`             | `tcop/utility.h`               |
+| Reserve shared memory         | `shmem_request_hook`              | `miscadmin.h`                  |
+| Initialise shared memory      | `shmem_startup_hook`              | `storage/ipc.h`                |
+| Allocate named segment        | `ShmemInitStruct()`               | `storage/shmem.h`              |
+| Cross-process locking         | `RequestNamedLWLockTranche()`     | `storage/lwlock.h`             |
+| Periodic background process   | `RegisterBackgroundWorker()`      | `postmaster/bgworker.h`        |
+| Issue DDL from C              | SPI (`SPI_connect`, `SPI_exec`)   | `executor/spi.h`               |
+| Read planner statistics       | `pg_statistic` via SPI            | catalog access                 |

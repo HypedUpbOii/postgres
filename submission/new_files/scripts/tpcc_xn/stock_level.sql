@@ -1,0 +1,14 @@
+-- TPC-C StockLevel (simplified): pure read.  Uses the recent N orders
+-- and counts distinct items.  Without an index on (o_w_id, o_d_id) this
+-- is a SeqScan.  The auto_index opportunity here is on order_line columns.
+\set wh    random(1, :scale)
+\set dist  random(1, 10)
+
+SELECT count(DISTINCT ol_i_id)
+  FROM order_line
+ WHERE ol_w_id = :wh
+   AND ol_d_id = :dist
+   AND ol_o_id BETWEEN
+       (SELECT d_next_o_id - 20 FROM district WHERE d_w_id = :wh AND d_id = :dist)
+       AND
+       (SELECT d_next_o_id      FROM district WHERE d_w_id = :wh AND d_id = :dist);

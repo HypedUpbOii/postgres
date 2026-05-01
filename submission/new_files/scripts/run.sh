@@ -1,0 +1,65 @@
+#!/bin/bash
+#
+# Manual operations on the running PostgreSQL inside the docker container.
+#
+# Usage: scripts/run.sh <command> [args...]
+#
+#   start             Start the server.
+#   stop              Stop the server (fast shutdown).
+#   restart           Restart the server.
+#   status            Show server status.
+#   psql [args...]    Drop into psql against the postgres database.
+#                     Extra args are forwarded:
+#                         scripts/run.sh psql -c "SELECT now()"
+#   logs              Tail /postgres/logfile.
+#   shell             Bash shell inside the container.
+#   reload            SIGHUP the server (pick up GUC changes from ALTER SYSTEM).
+#
+set -e
+
+CMD="${1:-help}"
+CONTAINER="pg-dev"
+shift || true
+
+PG_ENV="export PATH=/usr/local/pgsql/bin:\$PATH"
+
+case "$CMD" in
+    help|"")
+        sed -n '3,17p' "$0"
+        ;;
+    start)
+        docker compose exec "$CONTAINER" bash -c "$PG_ENV && \
+            pg_ctl -D /postgres/data start -l /postgres/logfile -w"
+        ;;
+    stop)
+        docker compose exec "$CONTAINER" bash -c "$PG_ENV && \
+            pg_ctl -D /postgres/data stop -m fast"
+        ;;
+    restart)
+        docker compose exec "$CONTAINER" bash -c "$PG_ENV && \
+            pg_ctl -D /postgres/data restart -l /postgres/logfile -w"
+        ;;
+    status)
+        docker compose exec "$CONTAINER" bash -c "$PG_ENV && \
+            pg_ctl -D /postgres/data status"
+        ;;
+    psql)
+        docker compose exec -it "$CONTAINER" \
+            /usr/local/pgsql/bin/psql -d postgres "$@"
+        ;;
+    logs)
+        docker compose exec "$CONTAINER" tail -f /postgres/logfile
+        ;;
+    shell)
+        docker compose exec -it "$CONTAINER" bash
+        ;;
+    reload)
+        docker compose exec "$CONTAINER" bash -c "$PG_ENV && \
+            psql -d postgres -c 'SELECT pg_reload_conf()'"
+        ;;
+    *)
+        echo "Unknown command: $CMD" >&2
+        echo "Run '$0 help' for usage." >&2
+        exit 1
+        ;;
+esac

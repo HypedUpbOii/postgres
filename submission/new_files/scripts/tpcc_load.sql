@@ -1,0 +1,65 @@
+-- TPC-C-lite data loader.  Uses :wh psql variable for warehouse count.
+-- Default scale: 2 warehouses, 10 districts each, 3000 customers per
+-- district, ~30000 orders per warehouse — roughly 10 MB total.
+
+-- Customers per district / districts per warehouse / orders per district.
+-- Don't put psql comments on the same line as \set — they become part of the
+-- variable's value (textual macro substitution).
+\set wh   :wh
+\set csts 3000
+\set dist 10
+\set ord  3000
+
+INSERT INTO warehouse (w_id, w_name, w_ytd, w_tax)
+SELECT w, 'wh' || w, 300000.00, 0.10
+FROM generate_series(1, :wh) w;
+
+INSERT INTO district (d_w_id, d_id, d_name, d_ytd, d_tax, d_next_o_id)
+SELECT w, d, 'd' || d, 30000.00, 0.10, 3001
+FROM generate_series(1, :wh) w,
+     generate_series(1, :dist) d;
+
+-- Customer last names follow TPC-C "C_LAST" syllable rule, simplified:
+-- pick from a small dictionary so duplicates are common (the realistic
+-- "lookup by last name" pattern).
+INSERT INTO customer (c_w_id, c_d_id, c_id,
+                      c_first, c_last,
+                      c_balance, c_credit,
+                      c_ytd_payment, c_payment_cnt)
+SELECT
+    w, d, c,
+    'first' || c,
+    (ARRAY['BAR','OUGHT','ABLE','PRI','PRES','ESE','ANTI','CALLY','ATION','EING'])
+        [(c % 10) + 1] ||
+    (ARRAY['BAR','OUGHT','ABLE','PRI','PRES','ESE','ANTI','CALLY','ATION','EING'])
+        [((c / 10) % 10) + 1],
+    -10.00,
+    CASE WHEN c % 10 = 0 THEN 'BC' ELSE 'GC' END,
+    10.00, 1
+FROM generate_series(1, :wh)   w,
+     generate_series(1, :dist) d,
+     generate_series(1, :csts) c;
+
+INSERT INTO orders (o_w_id, o_d_id, o_id, o_c_id, o_entry_d, o_carrier_id, o_ol_cnt)
+SELECT
+    w, d, o,
+    ((o - 1) % :csts) + 1,                  -- cyclic c_id
+    now() - (random() * interval '30 days'),
+    (random() * 10)::smallint + 1,
+    5
+FROM generate_series(1, :wh)  w,
+     generate_series(1, :dist) d,
+     generate_series(1, :ord)  o;
+
+-- 5 order_lines per order on average.
+INSERT INTO order_line (ol_w_id, ol_d_id, ol_o_id, ol_number,
+                        ol_i_id, ol_quantity, ol_amount)
+SELECT
+    o.o_w_id, o.o_d_id, o.o_id, n,
+    (random() * 100000)::int + 1,
+    (random() * 10)::smallint + 1,
+    (random() * 100)::numeric(6, 2)
+FROM orders o,
+     generate_series(1, 5) n;
+
+ANALYZE;

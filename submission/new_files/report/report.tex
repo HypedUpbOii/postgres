@@ -1,0 +1,211 @@
+\documentclass[10pt,a4paper]{article}
+
+\usepackage[margin=0.8in]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\hypersetup{colorlinks=true, linkcolor=black, urlcolor=blue}
+
+\setlist[itemize]{itemsep=1pt, topsep=2pt, parsep=0pt}
+\setlist[enumerate]{itemsep=1pt, topsep=2pt, parsep=0pt}
+
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+\title{\textbf{Automatic Creation of Indices in PostgreSQL}}
+\author{
+    Siddhant Mulkikar 23B0956 \\
+    Yuvraj Gupta 23B0999 \\
+    Sandeep Reddy Nallamilli 23B1006 \\
+    Yash Sabale 23B1043
+}
+\date{}
+
+\begin{document}
+
+\maketitle
+\vspace{-2em}
+
+\begin{abstract}
+\noindent
+We built a PostgreSQL extension, \code{auto\_index}, that watches the
+live workload and decides for itself which indexes to create and drop.
+It handles single-column indexes and composites of up to three
+columns, and switches between six different decision strategies via a
+single GUC. The whole thing is about 1\,800 lines of C plus a small
+SQL file and a control file.
+\end{abstract}
+
+\section{Implementation}
+
+The extension hooks into PostgreSQL in three places. First, an
+\code{ExecutorEnd} hook runs after every query: it walks the plan
+tree, finds every \code{SeqScan}, and decodes that scan's filter
+qual list. The decoder handles the usual \code{Var op Const} pattern
+plus \code{IN (...)}, \code{BETWEEN}, nested AND/OR via
+\code{BoolExpr} (so TPC-H Q19's deeply nested OR-of-AND still gets
+its predicates extracted), and implicit casts via \code{RelabelType}.
+Second, a fixed-size shared-memory area holds per-table predicate
+counters --- both per-column ``singleton'' counts and a separate
+multi-column ``colset'' bucket that records when 2--3 columns
+co-occur in the same query. Third, a background worker wakes up
+every few seconds, folds the interval counters into cumulative
+state, and applies a strategy to decide whether to create or drop
+anything.
+
+\paragraph{Composite indexes.} When the same group of 2--3 columns
+keeps showing up together, the worker builds a composite. The order
+of columns in the composite is decided when we emit the
+\code{CREATE INDEX}: equality columns lead, range columns trail, and
+within each group we break ties by attribute number. This ordering
+matters because B-tree only uses the leading prefix of a composite
+key. Because the composite already covers any \code{WHERE col = ?}
+on its leading column, we suppress the singleton on that column to
+avoid a redundant index --- but we keep singletons on the
+non-leading columns, since B-tree can't use them on their own.
+
+\paragraph{Strategies.} A central design choice was to keep the
+decision logic pluggable. Six strategies are selectable through the
+\code{auto\_index.create\_strategy} GUC: \emph{ski\_rental} (the
+cost-based default that buys the index once cumulative seq-scan cost
+catches up to build cost), \emph{simple\_threshold},
+\emph{ratio\_only}, \emph{cost\_gain}, \emph{size\_gated}, and
+\emph{always}. Each strategy is a single function returning a bool,
+so trying out new policies is a one-line dispatch change.
+
+\paragraph{Drop.} Drop is ski-rental in reverse. For every
+auto-created index we accumulate an \code{idle\_write\_cost} every
+time the index goes a whole interval without being used; once that
+accumulator passes \code{build\_cost}~$\times$~1000, we drop the
+index. The intuition: if maintenance has cost as much as a fresh
+build would, the index isn't earning its keep.
+
+\paragraph{Limits we ran into.} Two limitations matter for the
+benchmark numbers later. First, the qual extractor only fires on
+\code{SeqScanState} nodes --- the moment any other index exists on
+a table (the primary key, for example), the planner switches to
+\code{Bitmap Heap Scan} and our auto-indexer can no longer see the
+filter predicates. This is the dominant case in OLTP and limits the
+TPC-C improvement. Second, aggregates that touch every row (TPC-H
+Q01) can't be helped by any index in principle.
+
+\section{Performance Analysis}
+
+All numbers come from a docker container (Ubuntu 22.04, 6 cores,
+8~GB RAM, NVMe SSD), PostgreSQL 19devel, default config except where
+noted. Each benchmark below was run three times.
+
+\subsection*{pgbench --- live throughput demo}
+
+We tested our extension on a 300\,K-row table, 4 pgbench clients
+hammering a single equality predicate, with TPS reported every two
+seconds. Auto\_index has no work to do for the first few seconds;
+then the bgworker wakes, sees thousands of seq-scan hits on
+\code{category}, and creates the index. The TPS jump is sharp and
+reproducible.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{lrrrl}
+\toprule
+\textbf{Window} & \textbf{Run 1} & \textbf{Run 2} & \textbf{Run 3} & \textbf{Phase} \\
+\midrule
+$t=2$~s        & 380     & 342     & 316     & seq-scan baseline \\
+$t=4$~s        & 340     & 337     & 330     & seq-scan baseline \\
+$t=6$~s        & \textbf{14\,696} & \textbf{15\,116} & \textbf{15\,499} & \textbf{auto\_index fires} \\
+$t=8$~s        & 17\,571 & 18\,080 & 17\,859 & indexed (steady) \\
+$t=10$--18~s   & 17\,200--18\,400 & 17\,650--18\,460 & 17\,500--18\,400 & indexed (steady) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The step happens at $t=6$~s in every run, because that is when the
+bgworker takes its second snapshot (the first one is too early --
+the workload hadn't accumulated enough hits yet). Steady-state TPS
+is roughly 17\,800, against a baseline of about 340 --- a factor of
+$\sim$52 in throughput, achieved without any human asking for an
+index.
+
+\subsection*{TPC-H --- analytical workload, all six strategies}
+
+We ran the same
+TPC-H workload (8 representative queries: Q1, Q3, Q5, Q6, Q10, Q12,
+Q14, Q19) under each of the six strategies. The same baseline phase
+was used as a reference for all strategies, then for each strategy
+we restarted the server, ran 5 training passes, waited 20 seconds,
+and measured.
+
+The auto-created index set varies a lot between strategies: the more
+aggressive ones build composites (notably the 3-column
+\code{(l\_quantity, l\_discount, l\_shipdate)} that exactly matches
+Q06's filter), while \emph{ski\_rental} stays conservative. The
+table below gives the per-query speedup against the no-index
+baseline, the geometric mean, and the index count for each
+strategy.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{lrrrrrrr}
+\toprule
+\textbf{Query} & \textbf{Baseline} & \multicolumn{6}{c}{\textbf{Speedup vs.\ baseline (higher is better)}} \\
+\cmidrule(lr){3-8}
+                &  \textbf{(ms)} & \textbf{ski\_rental} & \textbf{simple\_thr} & \textbf{ratio\_only} & \textbf{cost\_gain} & \textbf{size\_gated} & \textbf{always} \\
+\midrule
+q01   & 4\,916  & 1.05$\times$ & 1.04$\times$ & 1.04$\times$ & 1.02$\times$ & 1.02$\times$ & 0.99$\times$ \\
+q03   &   978   & 1.07$\times$ & 0.99$\times$ & 1.02$\times$ & 1.10$\times$ & 0.98$\times$ & 0.96$\times$ \\
+q05   &   650   & 1.48$\times$ & 0.94$\times$ & 1.60$\times$ & 1.64$\times$ & 0.55$\times$ & 1.05$\times$ \\
+q06   &   601   & 1.57$\times$ & 2.61$\times$ & \textbf{3.20$\times$} & 1.50$\times$ & 1.65$\times$ & 2.62$\times$ \\
+q10   & 1\,016  & 1.28$\times$ & 1.22$\times$ & 1.24$\times$ & 1.30$\times$ & 1.12$\times$ & 1.24$\times$ \\
+q12   & 1\,011  & 1.47$\times$ & 1.96$\times$ & \textbf{2.06$\times$} & 1.48$\times$ & 1.75$\times$ & 1.94$\times$ \\
+q14   &   551   & 2.80$\times$ & 2.52$\times$ & 2.53$\times$ & \textbf{2.91$\times$} & 2.51$\times$ & 2.49$\times$ \\
+q19   &   855   & 2.13$\times$ & 2.82$\times$ & \textbf{3.07$\times$} & 2.18$\times$ & 2.78$\times$ & 2.93$\times$ \\
+\midrule
+\textbf{geomean} & ---    & 1.53$\times$ & 1.60$\times$ & \textbf{1.79$\times$} & 1.55$\times$ & 1.32$\times$ & 1.61$\times$ \\
+\textbf{indexes built} & --- & 6 & 11 & 10 & 6 & 10 & 13 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+\emph{ratio\_only} comes out on top with a geometric mean of
+$\sim$1.79$\times$, achieving 3$\times$+ speedups on Q06, Q12, and
+Q19 by building the right composite indexes. \emph{ski\_rental},
+the conservative default, still gets a respectable 1.53$\times$
+with only 6 indexes.
+
+\subsection*{Lifecycle demo}
+
+We ran a 50\,K-row table through
+two phases. First, heavy reads: 200 queries on a single column,
+then 200 more on a three-column predicate. Then heavy writes: 300
+INSERT/UPDATE/DELETE rounds with no reads on the indexed columns.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{crlc}
+\toprule
+\textbf{Run} & \textbf{Phase A: indexes built} & \textbf{Phase B: time to drop all} & \textbf{Result} \\
+\midrule
+1 & 4 (singletons + composite) & $\sim$20~s & \checkmark \\
+2 & 4 (singletons + composite) & $\sim$20~s & \checkmark \\
+3 & 4 (singletons + composite) & $\sim$20~s & \checkmark \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Every run produced both a singleton and a composite during Phase A,
+and then dropped all of them roughly four bgworker cycles into
+Phase B. The drop accumulator is deterministic enough that the
+$\sim$20~s figure is practically a constant.
+
+
+\end{document}

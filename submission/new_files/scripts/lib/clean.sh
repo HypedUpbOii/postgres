@@ -1,0 +1,41 @@
+#!/bin/bash
+# In-container: drop everything auto_index has created (test tables,
+# auto-indexes, catalog rows, shmem state).  Keeps the extension itself
+# installed.
+set -e
+
+export PATH=/usr/local/pgsql/bin:$PATH
+
+psql -d postgres <<'SQL'
+-- Drop every auto_idx_* index in any schema.
+DO $$
+DECLARE r record;
+BEGIN
+    FOR r IN SELECT schemaname, indexname FROM pg_indexes
+             WHERE indexname LIKE 'auto\_idx\_%' ESCAPE '\'
+    LOOP
+        EXECUTE format('DROP INDEX IF EXISTS %I.%I', r.schemaname, r.indexname);
+    END LOOP;
+END$$;
+
+-- Drop benchmark / demo tables if they exist.
+DROP TABLE IF EXISTS bench_test     CASCADE;
+DROP TABLE IF EXISTS demo_table     CASCADE;
+DROP TABLE IF EXISTS perf_test      CASCADE;
+DROP TABLE IF EXISTS drop_test      CASCADE;
+
+-- Reset extension state.
+DELETE FROM auto_index_catalog;
+SELECT auto_index_reset();
+
+-- Reset auto_index GUCs to defaults.
+ALTER SYSTEM RESET auto_index.threshold;
+ALTER SYSTEM RESET auto_index.check_interval;
+ALTER SYSTEM RESET auto_index.create_strategy;
+ALTER SYSTEM RESET auto_index.simple_threshold;
+ALTER SYSTEM RESET auto_index.min_table_rows;
+ALTER SYSTEM RESET auto_index.max_indexes_per_table;
+SELECT pg_reload_conf();
+SQL
+
+echo "✓ Clean complete."

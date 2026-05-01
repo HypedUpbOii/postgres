@@ -1,0 +1,118 @@
+#!/bin/bash
+#
+# In-container TPC-H setup.  Idempotent — re-runnable; skips steps already
+# done (clone, build, generate, schema, load).
+#
+# Called from scripts/benchmark.sh — not usually invoked directly.
+#
+# Env vars:
+#   SF=0.1          scale factor (0.01..10).  SF=1 ≈ 1 GB raw + ~2 GB in PG.
+#   DBGEN_REPO=...  override the dbgen git URL
+#   FORCE_RELOAD=1  drop and reload the schema even if data is already there
+#
+set -e
+
+export PATH=/usr/local/pgsql/bin:$PATH
+DB=postgres
+PSQL="psql -d $DB -X"
+
+SF=${SF:-0.1}
+DBGEN_REPO=${DBGEN_REPO:-https://github.com/electrum/tpch-dbgen.git}
+FORCE_RELOAD=${FORCE_RELOAD:-0}
+
+TPCH_DIR=/postgres/scripts/lib/tpch
+DBGEN_DIR=$TPCH_DIR/dbgen
+DATA_DIR=$TPCH_DIR/data-sf${SF}
+SCRIPTS_DIR=/postgres/scripts
+
+SEP="================================================================"
+banner() { echo ""; echo "$SEP"; echo "  $1"; echo "$SEP"; }
+
+mkdir -p "$TPCH_DIR"
+
+# ---------------------------------------------------------------------------
+# Step 1: clone + build dbgen
+# ---------------------------------------------------------------------------
+banner "Step 1: dbgen"
+
+if [ ! -x "$DBGEN_DIR/dbgen" ]; then
+    if [ ! -d "$DBGEN_DIR" ]; then
+        echo "[*] Cloning $DBGEN_REPO ..."
+        git clone --depth=1 "$DBGEN_REPO" "$DBGEN_DIR"
+    fi
+    echo "[*] Building dbgen ..."
+    (cd "$DBGEN_DIR" && make -s 2>&1 | tail -5)
+fi
+
+if [ ! -x "$DBGEN_DIR/dbgen" ]; then
+    echo "ERROR: dbgen build failed — see $DBGEN_DIR" >&2
+    exit 1
+fi
+echo "dbgen ready: $DBGEN_DIR/dbgen"
+
+# ---------------------------------------------------------------------------
+# Step 2: generate data
+# ---------------------------------------------------------------------------
+banner "Step 2: generating SF=$SF data"
+
+if [ ! -f "$DATA_DIR/lineitem.tbl" ]; then
+    mkdir -p "$DATA_DIR"
+    echo "[*] Running dbgen -s $SF (this may take a moment) ..."
+    # dbgen reads dists.dss from CWD, writes .tbl files to CWD by default.
+    # Run inside dbgen dir, then move output.
+    (cd "$DBGEN_DIR" && ./dbgen -s "$SF" -f -v 2>&1 | tail -5)
+    mv "$DBGEN_DIR"/*.tbl "$DATA_DIR"/
+
+    echo "[*] Stripping trailing pipe from .tbl files ..."
+    # dbgen emits a trailing | on every row; PG's COPY treats it as an
+    # extra empty column.  Remove it in place.
+    for f in "$DATA_DIR"/*.tbl; do
+        sed -i 's/|$//' "$f"
+    done
+fi
+
+echo "Data files:"
+ls -lh "$DATA_DIR"/*.tbl | awk '{print "  " $9 "  " $5}'
+
+# ---------------------------------------------------------------------------
+# Step 3: create schema
+# ---------------------------------------------------------------------------
+banner "Step 3: creating schema (PKs only, no secondary indexes)"
+
+# If lineitem already exists AND has rows AND we're not forcing reload, skip.
+EXISTING_ROWS=$($PSQL -Atq -c "SELECT count(*) FROM lineitem" 2>/dev/null || echo 0)
+
+if [ "$FORCE_RELOAD" = "1" ] || [ "$EXISTING_ROWS" = "0" ]; then
+    $PSQL -f "$SCRIPTS_DIR/tpch_schema.sql"
+    echo "Schema created."
+else
+    echo "Schema already loaded ($EXISTING_ROWS rows in lineitem). "
+    echo "Set FORCE_RELOAD=1 to re-load."
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Step 4: COPY data
+# ---------------------------------------------------------------------------
+banner "Step 4: loading data (COPY)"
+
+# Order matters less since there are no FKs, but keep it tidy.
+for table in region nation part supplier partsupp customer orders lineitem; do
+    f="$DATA_DIR/${table}.tbl"
+    rows_before=$($PSQL -Atq -c "SELECT count(*) FROM $table")
+    echo "  COPY $table  ($(stat -c%s "$f" | numfmt --to=iec))"
+    $PSQL -c "\COPY $table FROM '$f' WITH (FORMAT csv, DELIMITER '|', QUOTE E'\b')"
+    rows_after=$($PSQL -Atq -c "SELECT count(*) FROM $table")
+    echo "    +$((rows_after - rows_before)) rows"
+done
+
+# ---------------------------------------------------------------------------
+# Step 5: ANALYZE
+# ---------------------------------------------------------------------------
+banner "Step 5: ANALYZE"
+
+$PSQL -c "ANALYZE;"
+echo "Done."
+
+banner "TPC-H setup complete (SF=$SF)"
+echo "Next: scripts/benchmark.sh tpch"

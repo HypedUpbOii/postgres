@@ -1,0 +1,509 @@
+# PostgreSQL Internals Reference
+
+Covers the subsystems we touch in the auto_index extension. Not a general PG manual —
+just the parts that matter for this project.
+
+---
+
+## 1. Process Architecture
+
+PostgreSQL uses a multi-process model, not threads. Every connection gets its own OS
+process. Understanding who is alive when is critical.
+
+```
+postmaster  (the supervisor, PID 1 of the cluster)
+ ├── backend  (one per client connection)
+ ├── backend
+ ├── autovacuum launcher
+ ├── autovacuum worker
+ ├── bgwriter
+ ├── checkpointer
+ ├── walwriter
+ └── <our bgworker>   ← auto_index_main()
+```
+
+**Postmaster** forks everything. It never serves queries itself. It monitors children
+and restarts them on crash.
+
+**Backends** are forked from the postmaster for each new client connection. They share
+read-only memory inherited via `fork()` but have their own private heap.
+
+**Background workers** are processes registered at startup (or dynamically) that run
+arbitrary C code. They can connect to a database, run transactions, and access shared
+memory just like backends. Exit code 0 = never restart; exit code 1 = restart after
+`bgw_restart_time` seconds.
+
+### Why this matters for us
+
+Shared memory is the only way for backends and background workers to communicate
+without a network round-trip. Each backend writes its query stats into shared memory;
+the background worker reads them. This only works because all processes map the same
+physical pages at the same virtual address.
+
+---
+
+## 2. Startup Sequence
+
+Knowing this sequence is essential for understanding when hooks fire and why the
+shared memory size cannot change at runtime.
+
+```
+1. Postmaster starts
+2. Loads shared_preload_libraries  →  _PG_init() called for each library
+   - Hooks are installed
+   - shmem_request_hook fires     →  RequestAddinShmemSpace() / ShmemRequestStruct()
+   - Background workers registered
+3. Shared memory segment created and sized (NOW FIXED)
+   - shmem_startup_hook fires     →  ShmemInitStruct() / ShmemRequestHash()
+4. Postmaster forks system processes (bgwriter, checkpointer, walwriter, bgworkers)
+5. Postmaster enters accept() loop
+6. Client connects → postmaster fork()s a backend
+   - Backend inherits the already-mapped shared memory
+   - Hooks installed in step 2 are active in this backend
+```
+
+After step 3 the segment size is immutable. There is no way to grow it without
+restarting the postmaster.
+
+---
+
+## 3. Shared Memory
+
+### What it is
+
+A single memory region mapped at the same virtual address in every postgres process.
+Reads and writes are truly shared — a write by one backend is immediately visible to
+all others. No serialisation is automatic; you must use locks.
+
+### Sizing
+
+The total size is computed at step 2 above. Each subsystem (including extensions) calls
+`RequestAddinShmemSpace(n_bytes)` during `shmem_request_hook` to reserve its slice.
+The postmaster sums all requests and `mmap()`s that much memory once.
+
+```c
+/* Called during shmem_request_hook */
+static void
+auto_index_shmem_request(void)
+{
+    if (prev_shmem_request_hook)
+        prev_shmem_request_hook();  /* always chain! */
+
+    RequestAddinShmemSpace(
+        sizeof(AutoIndexSharedState) +
+        auto_index_max_tracked_tables * sizeof(AutoIndexTableStats)
+    );
+    RequestNamedLWLockTranche("auto_index", 1);
+}
+```
+
+### Attaching
+
+After the segment exists, get a pointer to your slice by name. The first caller
+allocates and zeroes it; subsequent callers (e.g. after a backend fork) just attach.
+`foundPtr` tells you which case you're in.
+
+```c
+/* Called during shmem_startup_hook */
+static void
+auto_index_shmem_startup(void)
+{
+    bool found;
+
+    if (prev_shmem_startup_hook)
+        prev_shmem_startup_hook();  /* always chain! */
+
+    auto_index_state = ShmemInitStruct("auto_index",
+                                       compute_shmem_size(),
+                                       &found);
+    if (!found)
+    {
+        /* First time: initialise the segment */
+        memset(auto_index_state, 0, compute_shmem_size());
+        auto_index_state->lock = &(GetNamedLWLockTranche("auto_index")[0].lock);
+    }
+}
+```
+
+### Newer API (PG 18+)
+
+`shmem.h` also exposes `ShmemRequestStruct()` / `RegisterShmemCallbacks()` which is
+cleaner, but `ShmemInitStruct()` + `RequestAddinShmemSpace()` is what contrib modules
+like `pg_stat_statements` use and is fine for our purposes.
+
+### Fixed-size constraint
+
+Because the segment is sized once at startup, you must pre-allocate for worst-case
+capacity. Use GUCs (`auto_index.max_tracked_tables`, `auto_index.max_columns_per_table`)
+to let operators tune this. Changing these GUCs requires a server restart.
+
+If all slots are full when a new table appears, evict the entry with the oldest
+`last_access` timestamp (LRU).
+
+---
+
+## 4. LWLocks (Lightweight Locks)
+
+LWLocks are fast shared/exclusive spin-locks designed for protecting shared memory.
+They are not transaction-aware and have no deadlock detection — keep the critical
+section short.
+
+```c
+/* Exclusive: one writer, no readers allowed */
+LWLockAcquire(auto_index_state->lock, LW_EXCLUSIVE);
+auto_index_state->tables[slot].seq_scan_count++;
+LWLockRelease(auto_index_state->lock);
+
+/* Shared: multiple readers allowed simultaneously */
+LWLockAcquire(auto_index_state->lock, LW_SHARED);
+memcpy(&snapshot, auto_index_state, sizeof(snapshot));
+LWLockRelease(auto_index_state->lock);
+```
+
+Declared in `storage/lwlock.h`. For finer-grained locking you can have one LWLock
+per table slot, but start with one global lock and optimise only if profiling shows
+contention.
+
+---
+
+## 5. The Hook System
+
+Hooks are global function pointers declared with `PGDLLIMPORT` in core headers.
+When a hook is NULL, the core runs its default behaviour. An extension sets the
+pointer to its own function and calls the previous value to chain.
+
+**Always save and restore the previous hook value.** Multiple extensions can be loaded
+at once and each one chains to the previous. Breaking the chain silently disables
+another extension.
+
+```c
+/* Module-level saved values */
+static ExecutorEnd_hook_type   prev_ExecutorEnd   = NULL;
+static ProcessUtility_hook_type prev_ProcessUtility = NULL;
+
+void _PG_init(void)
+{
+    prev_ExecutorEnd = ExecutorEnd_hook;
+    ExecutorEnd_hook = auto_index_executor_end;
+    /* ProcessUtility_hook not needed — DML goes through the executor, not utility */
+}
+
+static void
+auto_index_executor_end(QueryDesc *queryDesc)
+{
+    /* our logic here */
+    record_scan_stats(queryDesc);
+
+    /* chain to previous */
+    if (prev_ExecutorEnd)
+        prev_ExecutorEnd(queryDesc);
+    else
+        standard_ExecutorEnd(queryDesc);
+}
+```
+
+### Hooks we use
+
+| Hook | Header | Fires when |
+|---|---|---|
+| `shmem_request_hook` | `miscadmin.h` | Postmaster sizing shared memory |
+| `shmem_startup_hook` | `storage/ipc.h` | Shared memory segment just created |
+| `ExecutorEnd_hook` | `executor/executor.h` | Query finishes executing (SELECT and DML) |
+
+`ProcessUtility_hook` fires for DDL and other utility statements, but **not** for
+INSERT/UPDATE/DELETE — those go through the executor. Write tracking therefore lives
+in `ExecutorEnd_hook` alongside read tracking, by checking `queryDesc->operation`.
+
+---
+
+## 6. The Executor
+
+The executor is what actually runs a query plan. Understanding its data structures is
+necessary for the `ExecutorEnd_hook` implementation.
+
+### QueryDesc
+
+The top-level object describing an in-flight query. Created by `CreateQueryDesc()`,
+passed through `ExecutorStart` → `ExecutorRun` → `ExecutorEnd`.
+
+```c
+typedef struct QueryDesc {
+    CmdType      operation;      /* CMD_SELECT, CMD_INSERT, CMD_UPDATE, ... */
+    PlannedStmt *plannedstmt;    /* the plan from the planner */
+    const char  *sourceText;     /* original SQL string */
+    EState      *estate;         /* executor-wide state (snapshot, result rels) */
+    PlanState   *planstate;      /* root of the per-node execution state tree */
+    ...
+} QueryDesc;
+```
+
+`queryDesc->planstate` is the entry point for walking the execution tree.
+
+### PlanState tree
+
+Every node in the plan (SeqScan, HashJoin, Sort, etc.) has a corresponding `PlanState`
+node that holds its runtime state. They mirror the static `Plan` tree from the planner.
+
+```c
+typedef struct PlanState {
+    NodeTag     type;        /* T_SeqScanState, T_HashJoinState, etc. */
+    Plan       *plan;        /* the static plan node */
+    EState     *state;       /* shared executor state */
+    ExprState  *qual;        /* evaluated WHERE conditions for this node */
+    PlanState  *lefttree;    /* left child */
+    PlanState  *righttree;   /* right child */
+    ...
+} PlanState;
+```
+
+To walk the whole tree recursively:
+
+```c
+static void
+walk_plan_state(PlanState *node)
+{
+    if (node == NULL) return;
+
+    if (IsA(node, SeqScanState))
+        handle_seqscan((SeqScanState *) node);
+
+    walk_plan_state(node->lefttree);
+    walk_plan_state(node->righttree);
+
+    /* Also walk subplans (e.g. correlated subqueries) */
+    ListCell *lc;
+    foreach(lc, node->subPlan)
+        walk_plan_state((PlanState *) ((SubPlanState *) lfirst(lc))->planstate);
+}
+```
+
+### SeqScanState
+
+```c
+typedef struct SeqScanState {
+    ScanState ss;        /* first field — contains ss.ss_currentRelation (the heap) */
+    ...
+} SeqScanState;
+```
+
+Get the table OID: `((SeqScanState *) node)->ss.ss_currentRelation->rd_id`
+
+### Quals and predicate extraction
+
+`PlanState.qual` is an `ExprState *` — a compiled, ready-to-evaluate expression tree.
+For extracting column information you want the *uncompiled* expression from the Plan
+node itself: `((SeqScan *) node->plan)->plan.qual` (a `List *` of `Expr *`).
+
+Walk this list looking for `OpExpr` nodes (operator expressions like `col = 5` or
+`col > 10`):
+
+```c
+ListCell *lc;
+foreach(lc, ((Scan *) node->plan)->plan.qual)
+{
+    Expr *expr = (Expr *) lfirst(lc);
+
+    if (IsA(expr, OpExpr))
+    {
+        OpExpr *op = (OpExpr *) expr;
+        /* args is a 2-element list for binary operators */
+        Expr *left  = linitial(op->args);
+        Expr *right = lsecond(op->args);
+
+        if (IsA(left, Var) && IsA(right, Const))
+        {
+            AttrNumber attno = ((Var *) left)->varattno;
+            /* attno is the column number — record it */
+        }
+        else if (IsA(left, Const) && IsA(right, Var))
+        {
+            AttrNumber attno = ((Var *) right)->varattno;
+        }
+    }
+}
+```
+
+To distinguish equality from range predicates, look up the operator OID in `pg_operator`
+or compare against the well-known OIDs from `utils/lsyscache.h` (`get_op_opfamily_membership`).
+
+---
+
+## 7. SPI (Server Programming Interface)
+
+SPI lets C code inside a backend or background worker run SQL and access the catalog.
+It is how our background worker issues `CREATE INDEX` and reads `pg_statistic`.
+
+### Basic pattern
+
+```c
+SPI_connect();
+
+int ret = SPI_execute("SELECT reltuples FROM pg_class WHERE oid = $1",
+                      false, /* read-write */
+                      1);    /* max rows, 0 = all */
+
+if (ret == SPI_OK_SELECT && SPI_processed > 0)
+{
+    HeapTuple tuple = SPI_tuptable->vals[0];
+    TupleDesc desc  = SPI_tuptable->tupdesc;
+    float4 reltuples = DatumGetFloat4(
+        SPI_getbinval(tuple, desc, 1, &isnull));
+}
+
+SPI_finish();
+```
+
+### Non-atomic SPI for CREATE INDEX CONCURRENTLY
+
+`CREATE INDEX CONCURRENTLY` cannot run inside a transaction (it needs two table scans
+in separate transactions). Normal `SPI_connect()` always starts a transaction.
+Use the non-atomic variant in the background worker:
+
+```c
+SPI_connect_ext(SPI_OPT_NONATOMIC);
+SPI_execute("CREATE INDEX CONCURRENTLY ...", false, 0);
+SPI_finish();
+```
+
+`SPI_OPT_NONATOMIC` tells SPI not to wrap the call in a transaction, so PG's internal
+transaction machinery handles the `CONCURRENTLY` logic correctly.
+
+### Parameterised queries
+
+Prefer `SPI_execute_with_args()` over string concatenation to avoid SQL injection and
+to benefit from plan caching:
+
+```c
+Oid argtypes[2] = { OIDOID, INT2OID };
+Datum args[2]   = { ObjectIdGetDatum(relid), Int16GetDatum(attno) };
+char nulls[2]   = { ' ', ' ' };  /* ' ' = not null */
+
+SPI_execute_with_args(
+    "SELECT 1 FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid "
+    "WHERE i.indrelid = $1 AND a.attnum = $2 AND a.attnum = ANY(i.indkey)",
+    2, argtypes, args, nulls, true /* read-only */, 0);
+```
+
+---
+
+## 8. Background Worker Lifecycle
+
+```c
+void
+_PG_init(void)
+{
+    BackgroundWorker worker;
+    memset(&worker, 0, sizeof(worker));
+
+    snprintf(worker.bgw_name,          BGW_MAXLEN, "auto_index worker");
+    snprintf(worker.bgw_type,          BGW_MAXLEN, "auto_index");
+    snprintf(worker.bgw_library_name,  MAXPGPATH,  "auto_index");
+    snprintf(worker.bgw_function_name, BGW_MAXLEN, "auto_index_main");
+
+    worker.bgw_flags      = BGWORKER_SHMEM_ACCESS |
+                            BGWORKER_BACKEND_DATABASE_CONNECTION;
+    worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+    worker.bgw_restart_time = 10;  /* restart 10s after crash */
+
+    RegisterBackgroundWorker(&worker);
+}
+
+void
+auto_index_main(Datum main_arg)
+{
+    /* Must be called first */
+    BackgroundWorkerInitializeConnection("postgres", NULL, 0);
+
+    /* Unblock signals */
+    BackgroundWorkerUnblockSignals();
+
+    while (true)
+    {
+        /* Sleep until latch fires or timeout */
+        WaitLatch(MyLatch,
+                  WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+                  auto_index_check_interval * 1000L,  /* ms */
+                  PG_WAIT_EXTENSION);
+        ResetLatch(MyLatch);
+
+        CHECK_FOR_INTERRUPTS();  /* handle SIGTERM gracefully */
+
+        evaluate_and_manage_indexes();
+    }
+}
+```
+
+`BgWorkerStart_RecoveryFinished` means the worker starts only after the cluster is
+in a read-write state (safe for DDL). Use `BgWorkerStart_PostmasterStart` only if
+you don't need a database connection.
+
+`WL_EXIT_ON_PM_DEATH` makes `WaitLatch` return with an error if the postmaster dies,
+which unwinds the stack and terminates the worker cleanly.
+
+---
+
+## 9. GUC Parameters
+
+GUCs (Grand Unified Configuration) are the variables you set in `postgresql.conf` or
+via `SET` / `ALTER SYSTEM`. Extensions can register their own.
+
+```c
+static int   auto_index_max_tracked_tables = 256;
+static double auto_index_threshold         = 10.0;
+
+void _PG_init(void)
+{
+    DefineCustomIntVariable(
+        "auto_index.max_tracked_tables",
+        "Maximum number of tables to track in shared memory.",
+        NULL,
+        &auto_index_max_tracked_tables,
+        256,    /* default */
+        1,      /* min */
+        65536,  /* max */
+        PGC_POSTMASTER,  /* context: only changeable at postmaster start */
+        0, NULL, NULL, NULL);
+
+    DefineCustomRealVariable(
+        "auto_index.threshold",
+        "Benefit/cost ratio above which an index is created.",
+        NULL,
+        &auto_index_threshold,
+        10.0, 1.0, 1000.0,
+        PGC_SIGHUP,  /* context: reloadable with pg_reload_conf() */
+        0, NULL, NULL, NULL);
+}
+```
+
+### GUC contexts
+
+| Context | When it can change |
+|---|---|
+| `PGC_POSTMASTER` | Server restart only — use for anything that affects shmem size |
+| `PGC_SIGHUP` | `pg_reload_conf()` or `SIGHUP` to postmaster — no restart needed |
+| `PGC_USERSET` | Any time with `SET auto_index.threshold = 5.0` |
+
+`max_tracked_tables` and `max_columns_per_table` **must** be `PGC_POSTMASTER` since
+they determine the shared memory allocation computed in `shmem_request_hook`.
+
+---
+
+## 10. Key Source Files for Reference
+
+| File | What to read it for |
+|---|---|
+| `contrib/pg_stat_statements/pg_stat_statements.c` | Complete example of hooks + shared memory + bgworker in one extension |
+| `contrib/auto_explain/auto_explain.c` | Minimal executor hook example |
+| `src/backend/executor/execMain.c` | `ExecutorStart`, `ExecutorRun`, `ExecutorEnd` implementations; `queryDesc->operation` |
+| `src/backend/executor/nodeSeqscan.c` | How SeqScan fetches tuples and evaluates quals |
+| `src/backend/postmaster/autovacuum.c` | Production-quality background worker with per-DB logic |
+| `src/backend/postmaster/bgworker.c` | Background worker registration and lifecycle |
+| `src/include/executor/executor.h` | Executor hook type declarations |
+| `src/include/executor/execdesc.h` | `QueryDesc` struct |
+| `src/include/nodes/execnodes.h` | `PlanState`, `SeqScanState`, `ScanState` structs |
+| `src/include/postmaster/bgworker.h` | `BackgroundWorker` struct and registration API |
+| `src/include/storage/shmem.h` | `ShmemInitStruct`, `RequestAddinShmemSpace` |
+| `src/include/storage/lwlock.h` | `LWLockAcquire`, `LWLockRelease` |
+| `src/include/executor/spi.h` | Full SPI API |
+| `src/include/utils/lsyscache.h` | `get_op_opfamily_membership` — classify operators as equality vs range |
+| `pg_stat_user_indexes` (system view) | Per-index `idx_scan` counts used by the bgworker for DROP decisions |
